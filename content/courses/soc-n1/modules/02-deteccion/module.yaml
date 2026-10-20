@@ -1,0 +1,24 @@
+id: 02-deteccion
+course_id: soc-n1
+title: Detección y análisis de amenazas
+phase: 2
+subtitle: El núcleo del trabajo SOC N1
+duration: Meses 3-4
+outcome: 'Al terminar podrás hacer triage de una alerta real: leer el log, buscar el IoC y determinar
+  si es falso positivo o incidente.'
+lessons:
+- 01-lectura-logs
+- 02-siem-basico
+- 03-triage-iocs
+exam: null
+resources:
+- title: TryHackMe — SOC Level 1 Path
+  url: https://tryhackme.com/path/outline/soclevel1
+  type: lab
+  note: Recurso principal de esta fase
+- title: Splunk Free Training — Splunk Fundamentals 1
+  url: https://www.splunk.com/en_us/training/courses/splunk-fundamentals-1.html
+  type: curso
+- title: John Hammond (YouTube) — análisis de malware y logs
+  url: https://www.youtube.com/@_JohnHammond
+  type: video

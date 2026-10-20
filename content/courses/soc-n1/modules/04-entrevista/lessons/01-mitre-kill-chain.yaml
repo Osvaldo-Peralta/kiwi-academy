@@ -1,0 +1,37 @@
+id: 01-mitre-kill-chain
+module_id: 04-entrevista
+course_id: soc-n1
+title: 'Frameworks: MITRE ATT&CK y Cyber Kill Chain'
+kind: teoria
+estimated_minutes: 120
+status: draft
+summary: Hablar el lenguaje del SOC. Asociar técnicas a IDs de MITRE (ej. T1059 Command Scripting) es
+  exactamente lo que los entrevistadores buscan.
+objectives:
+- Navegar la matriz ATT&CK (tácticas, técnicas, sub-técnicas)
+- Mapear escenarios de logs a IDs de MITRE
+- Explicar la Kill Chain y su relación con las defensas
+theory:
+- id: t1
+  section: Contenido en construcción
+  format: markdown
+  body: 'Esta lección forma parte del roadmap del curso y su contenido detallado
+
+    está **en construcción** (igual que la Fase 1: teoría + ejemplos + ejercicios
+
+    + feedback).
+
+
+    **Contenido planeado:** Matriz Enterprise, ejercicios de mapeo log→técnica, detecciones por técnica
+    (Data Sources), narrativa de entrevista con ATT&CK.
+
+
+    Mientras tanto, puedes adelantar con los recursos recomendados del módulo.
+
+    Cuando esté publicada, esta tarjeta se habilitará automáticamente: la
+
+    plataforma detecta el cambio de `status: draft` a `status: published` sin
+
+    tocar código.'
+examples: []
+exercises: []

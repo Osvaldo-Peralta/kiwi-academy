@@ -1,0 +1,23 @@
+id: 04-entrevista
+course_id: soc-n1
+title: Preparación para la entrevista
+phase: 4
+subtitle: Traducir el conocimiento a oportunidades reales
+duration: Meses 8-10
+outcome: Al terminar tendrás CV listo, portfolio con labs y respuestas preparadas para las preguntas más
+  comunes de entrevistas SOC N1.
+lessons:
+- 01-mitre-kill-chain
+- 02-proceso-ir
+- 03-cv-portfolio-simulacros
+exam: null
+resources:
+- title: attack.mitre.org — referencia gratuita y oficial
+  url: https://attack.mitre.org/
+  type: referencia
+- title: Gerald Auger (YouTube) — preparación entrevistas SOC
+  url: https://www.youtube.com/@SimplyCyber
+  type: video
+- title: 'LinkedIn Jobs — filtrar: SOC Analyst + Junior + tu región'
+  url: https://www.linkedin.com/jobs/
+  type: empleo

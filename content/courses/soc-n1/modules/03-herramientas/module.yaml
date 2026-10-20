@@ -1,0 +1,23 @@
+id: 03-herramientas
+course_id: soc-n1
+title: Herramientas y laboratorio práctico
+phase: 3
+subtitle: Donde más brillará tu background de dev
+duration: Meses 5-7
+outcome: 'Al terminar tendrás un portfolio: scripts Python para SOC + 5-10 labs resueltos que mostrar
+  en entrevistas.'
+lessons:
+- 01-wireshark
+- 02-python-para-soc
+- 03-ctfs-blue-team
+exam: null
+resources:
+- title: CyberDefenders.org — Labs gratuitos de análisis
+  url: https://cyberdefenders.org/
+  type: lab
+- title: Blue Team Labs Online (BTLO)
+  url: https://blueteamlabs.online/
+  type: lab
+- title: The Hacker Playbook (perspectiva ofensiva para entender qué detectar)
+  url: null
+  type: libro

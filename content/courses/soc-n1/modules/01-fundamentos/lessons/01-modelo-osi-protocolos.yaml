@@ -1,0 +1,529 @@
+id: 01-modelo-osi-protocolos
+module_id: 01-fundamentos
+course_id: soc-n1
+title: "Redes: modelo OSI / TCP-IP"
+kind: teoria
+estimated_minutes: 120
+status: published
+summary: >-
+  Cómo fluye la información en una red: modelo OSI, TCP/UDP/ICMP, puertos,
+  DNS y HTTP/S. Todo desde la perspectiva de lo que verás en los logs de un
+  SOC. Tu background de APIs te da ventaja aquí.
+objectives:
+  - "Ubicar cualquier protocolo y alerta en la capa correcta del modelo OSI"
+  - "Explicar el handshake TCP de 3 vías y reconocer sus flags en una captura"
+  - "Identificar puertos y servicios clave (y los anómalos) en logs de firewall"
+  - "Reconocer abuso de DNS (tunneling/exfiltración) en un log"
+  - "Leer un log de proxy HTTP y detectar patrones sospechosos"
+
+theory:
+  - id: t1
+    section: "¿Por qué un analista SOC vive en los logs de red?"
+    format: markdown
+    body: |-
+      Un SOC (Security Operations Center) monitorea, detecta y responde a
+      incidentes de seguridad. El 80% del día de un analista N1 es **leer logs**:
+      de firewall, de proxy, de DNS, de servidores, de endpoints.
+
+      Cada alerta que te llegue tendrá una "historia de red" detrás:
+      **quién** (IP origen), **a quién** (IP destino), **por dónde** (puerto),
+      **cómo** (protocolo) y **qué hizo** (flags, método HTTP, query DNS).
+
+      Si dominas esta lección, podrás reconstruir esa historia en segundos.
+      Como dev que consume y expone APIs, ya entiendes request/response;
+      ahora aprenderás a verlo "desde abajo" y a detectar cuando algo huele mal.
+
+  - id: t2
+    section: "Modelo OSI (7 capas) vs TCP/IP (4 capas)"
+    format: markdown
+    body: |-
+      OSI es el modelo de referencia teórico; TCP/IP es el que realmente corre
+      en Internet. En el SOC se habla en términos OSI porque es más granular.
+
+      | # | Capa OSI | PDU | Protocolos típicos | Qué ve el SOC aquí |
+      |---|----------|-----|--------------------|--------------------|
+      | 7 | Aplicación | Datos | HTTP, DNS, SMTP, FTP, SSH | Logs de proxy, DNS, mail; payloads maliciosos |
+      | 6 | Presentación | Datos | TLS/SSL, cifrado, formatos | Alertas de certificados inválidos, TLS anómalo |
+      | 5 | Sesión | Datos | NetBIOS, sesiones RPC | Sesiones SMB en redes Windows |
+      | 4 | Transporte | Segmento | TCP, UDP | Puertos, flags, escaneos, floods |
+      | 3 | Red | Paquete | IP, ICMP | IPs origen/destino, TTL, routing, pings |
+      | 2 | Enlace | Trama | Ethernet, ARP, Wi-Fi | MACs, ARP spoofing, rogue devices |
+      | 1 | Física | Bit | cables, fibra, radio | (rara vez llega al SOC) |
+
+      **Regla mnemotécnica:** *All People Seem To Need Data Processing*
+      (Application → Physical).
+
+      En la práctica diaria usarás sobre todo las capas 3, 4 y 7:
+      - **Capa 3:** "¿esta IP es interna o externa? ¿de qué país/reputación?"
+      - **Capa 4:** "¿qué puerto? ¿hubo handshake completo o es un escaneo?"
+      - **Capa 7:** "¿qué pidió exactamente? ¿qué User-Agent? ¿qué query DNS?"
+
+      **Rangos privados (RFC 1918)** — clave para saber si el tráfico es interno:
+      - `10.0.0.0/8`
+      - `172.16.0.0/12`
+      - `192.168.0.0/16`
+
+      Todo lo demás es público (Internet). Ojo con **NAT**: muchas IPs privadas
+      salen a Internet detrás de una sola IP pública, así que en logs externos
+      verás la IP del firewall, no la del equipo.
+
+  - id: t3
+    section: "TCP: handshake de 3 vías, flags y estados"
+    format: markdown
+    body: |-
+      TCP es **orientado a conexión**: antes de hablar, ambos extremos se
+      sincronizan con el *three-way handshake*:
+
+      ```text
+      Cliente                Servidor
+         |--- SYN (seq=x) ------>|     "quiero conectar"
+         |<-- SYN-ACK (seq=y,    |     "ok, yo también quiero"
+         |        ack=x+1) ------|
+         |--- ACK (ack=y+1) ---->|     "perfecto, empecemos"
+      ```
+
+      **Flags TCP que verás en capturas y logs de firewall:**
+
+      | Flag | Nombre | Significado |
+      |------|--------|-------------|
+      | S | SYN | Solicitud de conexión (inicio del handshake) |
+      | A | ACK | Reconocimiento |
+      | F | FIN | Cierre ordenado de la conexión |
+      | R | RST | Reset abrupto (conexión rechazada/rota) |
+      | P | PSH | Push: entrega inmediata de datos |
+      | U | URG | Datos urgentes |
+
+      En `tcpdump`, los flags se ven como `Flags [S]`, `Flags [S.]`
+      (SYN+ACK), `Flags [.]` (solo ACK), `Flags [P.]` (PSH+ACK),
+      `Flags [R]` (RST).
+
+      **Por qué importa en el SOC:**
+      - Un **SYN sin ACK posterior** = intento de conexión que no prosperó
+        (bloqueado por firewall, puerto cerrado, o *half-open* de un escáner).
+      - Muchos **SYN a puertos distintos desde la misma IP en segundos**
+        = escaneo de puertos (nmap -sS deja exactamente esa firma).
+      - Muchos **SYN al mismo puerto/servicio sin completar** desde miles de
+        IPs = posible **SYN flood** (DoS).
+      - Conexión completa (SYN → SYN-ACK → ACK) + volumen de datos = la
+        conexión *sí sucedió*: ya no es un intento, es tráfico real.
+
+  - id: t4
+    section: "UDP e ICMP: los otros protagonistas"
+    format: markdown
+    body: |-
+      **UDP** es *connectionless*: dispara y olvida. No hay handshake ni
+      confirmación. Se usa donde la velocidad importa más que la fiabilidad:
+      - **DNS** (53/udp): consultas de nombres
+      - **DHCP** (67/68): asignación de IPs
+      - **NTP** (123): sincronización de hora
+      - Streaming, VoIP, videojuegos
+
+      En el SOC: el tráfico UDP no tiene "estados" claros, así que los
+      firewalls lo rastrean por sesión/timeout. Un host interno generando
+      **UDP masivo hacia afuera** puede ser exfiltración o participación
+      en un ataque de amplificación (DNS/NTP reflectors).
+
+      **ICMP** es el protocolo de control/diagnóstico (no lleva datos de
+      aplicación):
+      - `ping` = ICMP type 8 (echo request) / type 0 (echo reply)
+      - "Destination unreachable" = type 3 (¡útil: te dice que un escaneo
+        encontró puertos cerrados!)
+      - TTL expirado = type 11 (así funciona `traceroute`)
+
+      En el SOC: un barrido ICMP a toda una red (`ping sweep`) suele ser
+      **reconocimiento** previo a un ataque. También existe exfiltración
+      ocultando datos dentro de paquetes ICMP (ICMP tunneling): pings con
+      payloads anormalmente grandes.
+
+  - id: t5
+    section: "Puertos y servicios: tu mapa mental de bolsillo"
+    format: markdown
+    body: |-
+      El puerto es la "puerta" lógica (0-65535) que identifica al proceso
+      dentro del host. Los **well-known** van del 0 al 1023.
+
+      **Los que SÍ o SÍ debes saber de memoria (aparecen en entrevistas):**
+
+      | Puerto | Proto | Servicio | Nota SOC |
+      |--------|-------|----------|----------|
+      | 20/21 | TCP | FTP | Credenciales en claro; ya no debería existir |
+      | 22 | TCP | SSH | Administración remota; objetivo de brute-force constante |
+      | 23 | TCP | Telnet | Todo en texto plano; verlo abierto = hallazgo |
+      | 25 | TCP | SMTP | Correo entre servidores; spam/phishing |
+      | 53 | TCP/UDP | DNS | Resolución de nombres; canal de C2/exfil |
+      | 67/68 | UDP | DHCP | Asignación de IPs |
+      | 80 | TCP | HTTP | Web en claro |
+      | 110/143 | TCP | POP3/IMAP | Recepción de correo |
+      | 123 | UDP | NTP | Hora; amplificación DoS |
+      | 135-139, 445 | TCP | SMB/NetBIOS | Compartidos Windows; worms (WannaCry usó 445) |
+      | 389/636 | TCP | LDAP/LDAPS | Directorio activo |
+      | 443 | TCP | HTTPS | Web cifrada (y C2 disfrazado) |
+      | 1433 | TCP | MSSQL | Base de datos Microsoft |
+      | 3306 | TCP | MySQL | Base de datos |
+      | 3389 | TCP | RDP | Escritorio remoto Windows; favorito del ransomware |
+      | 5432 | TCP | PostgreSQL | Base de datos |
+      | 5900 | TCP | VNC | Escritorio remoto (a menudo sin cifrar) |
+
+      **Puertos efímeros** (origen de las conexiones salientes):
+      ~32768-60999 en Linux, 49152-65535 en Windows. Que el puerto *origen*
+      sea alto y aleatorio es normal; lo que analizas es el *destino*.
+
+      **Señales de alerta típicas:**
+      - Servicio de gestión (22, 3389, 445, 5900) expuesto **a Internet**
+      - Tráfico a puertos raros: 4444 (Metasploit por defecto), 1337, 31337,
+        6667 (IRC — C2 clásico), 8888, altos no efímeros usados como destino
+      - Base de datos (3306/5432/1433) accesible desde fuera de la red interna
+      - DNS saliendo por un servidor que no es el corporativo
+
+  - id: t6
+    section: "DNS: resolución de nombres y por qué es el canal favorito del atacante"
+    format: markdown
+    body: |-
+      Cuando escribes `api.ejemplo.com`, pasa esto:
+
+      ```text
+      1. Tu PC pregunta a su resolver (el DNS corporativo o el del ISP)
+      2. El resolver pregunta a un root server  -> "pregunta a los .com"
+      3. Pregunta al TLD .com                   -> "pregunta al NS de ejemplo.com"
+      4. Pregunta al nameserver de ejemplo.com  -> "api.ejemplo.com = 93.184.216.34"
+      5. Respuesta en caché + tu PC conecta a 93.184.216.34:443
+      ```
+
+      **Tipos de registro que debes conocer:**
+
+      | Tipo | Para qué | Uso malicioso típico |
+      |------|----------|----------------------|
+      | A | nombre → IPv4 | DGA, fast-flux, dominios C2 |
+      | AAAA | nombre → IPv6 | igual, menos monitoreado |
+      | CNAME | alias → otro nombre | encadenar infraestructura |
+      | MX | servidores de correo | phishing/spam |
+      | TXT | texto libre (SPF, DKIM) | **exfiltración por DNS tunneling** |
+      | NS | nameservers autoritativos | secuestro de dominio |
+
+      **DNS tunneling / exfiltración:** el atacante codifica datos robados en
+      los subdominios de sus consultas (`<datos-en-base64>.malvado.com`) y los
+      "lee" desde su servidor autoritativo. Como el DNS casi nunca se bloquea
+      (rompería todo), es un canal de exfiltración y C2 muy popular.
+
+      **Indicadores en el log DNS:**
+      - Subdominios larguísimos con apariencia base64/hex
+      - Volumen anormal de consultas TXT o NULL desde un host
+      - Miles de queries de un mismo equipo en minutos
+      - NXDOMAIN en masa desde un host (posible malware con **DGA**: dominios
+        generados algorítmicamente, prueba cientos hasta encontrar el activo)
+      - Consultas a dominios recién registrados o de baja reputación
+
+  - id: t7
+    section: "HTTP/S: lo que el proxy ve (y tú también)"
+    format: markdown
+    body: |-
+      Como dev esto te es familiar, pero ahora míralo con ojos de analista.
+      Un log de proxy/web típico tiene: timestamp, IP cliente, método, URL,
+      User-Agent, código de respuesta, bytes.
+
+      **Métodos:** GET (lee), POST (envía datos — ojo con exfiltración vía
+      POST a dominios raros), PUT/DELETE (modificación — raro en navegación
+      normal de usuarios).
+
+      **Códigos de estado que importan en el SOC:**
+
+      | Código | Significado | Lectura SOC |
+      |--------|-------------|-------------|
+      | 200 | OK | Éxito — si es login, ¡el atacante entró! |
+      | 301/302 | Redirección | Normal, pero también en open-redirects |
+      | 400 | Bad request | Payloads malformados (¿exploit torpe?) |
+      | 401 | No autenticado | Credenciales requeridas/inválidas |
+      | 403 | Prohibido | Autenticado pero sin permiso (¿exploración?) |
+      | 404 | No encontrado | **Muchos 404 seguidos = escaneo de rutas/admin** |
+      | 500 | Error servidor | Puede indicar inyección que "rompió" la query |
+
+      **User-Agents sospechosos:** vacíos, genéricos (`python-requests/2.31`,
+      `curl/8.0` desde una workstation de contabilidad), o de herramientas
+      conocidas (`sqlmap`, `nikto`, `nmap scripting engine`, `masscan`).
+
+      **Patrón de escaneo web:** decenas de requests a `/admin`, `/wp-login.php`,
+      `/.env`, `/phpmyadmin`, `/backup.zip` con 404, desde una misma IP y en
+      pocos segundos.
+
+      **HTTPS:** el proxy ve SNI (el dominio en el ClientHello TLS, sin cifrar
+      en TLS 1.2) pero no la URL completa. Por eso los logs de proxy con HTTPS
+      muestran dominio + bytes, no rutas. ECH (TLS 1.3 + ESNI) lo está cambiando.
+
+examples:
+  - id: e1
+    section: "Ejemplo 1 — Leyendo un log de firewall línea por línea"
+    format: markdown
+    body: |-
+      ```text
+      Sep 14 08:23:11 fw01 kernel: [UFW BLOCK] IN=eth0 OUT=
+      SRC=185.220.101.34 DST=192.168.1.15 LEN=60 TTL=45 ID=54321
+      PROTO=TCP SPT=44912 DPT=445 WINDOW=29200 SYN URGP=0
+      ```
+
+      Anatomía:
+      - `[UFW BLOCK]` → el firewall **bloqueó** el paquete
+      - `SRC=185.220.101.34` → origen **público** (esta red es conocida por
+        hospedar nodos Tor; lo verificarías en threat intel)
+      - `DST=192.168.1.15` → destino **privado** (alguien interno)
+      - `PROTO=TCP`, `SPT=44912` → puerto origen efímero (normal)
+      - `DPT=445` → **SMB**: compartido de archivos Windows
+      - `SYN` → primer paso del handshake: un *intento* de conexión
+
+      **Lectura de analista:** "Un host externo intentó conectar a SMB (445)
+      de una workstation interna y fue bloqueado." SMB jamás debería recibirse
+      desde Internet: es firma clásica de worms/scanners (EternalBlue/WannaCry).
+      Un evento aislado = ruido de Internet. Cientos desde la misma IP, o
+      hacia varias IPs internas = escaneo dirigido → se documenta y escala.
+
+  - id: e2
+    section: "Ejemplo 2 — Un handshake completo en tcpdump"
+    format: markdown
+    body: |-
+      ```text
+      10:15:01.123456 IP 192.168.1.15.52344 > 93.184.216.34.443: Flags [S], seq 1234567, win 64240
+      10:15:01.234567 IP 93.184.216.34.443 > 192.168.1.15.52344: Flags [S.], seq 7654321, ack 1234568, win 65160
+      10:15:01.234890 IP 192.168.1.15.52344 > 93.184.216.34.443: Flags [.], ack 1, win 502
+      10:15:01.301222 IP 192.168.1.15.52344 > 93.184.216.34.443: Flags [P.], seq 1:518, ack 1, length 517
+      ```
+
+      Lectura:
+      1. `[S]` → SYN: la workstation pide conexión al 443 (HTTPS)
+      2. `[S.]` → SYN-ACK: el servidor acepta
+      3. `[.]` → ACK: handshake completo, **conexión establecida**
+      4. `[P.]` con `length 517` → datos reales (probablemente el
+         ClientHello TLS)
+
+      Si solo vieras `[S]` seguido de `[R.]` (RST), la conexión fue
+      **rechazada**: puerto cerrado o firewall. Esa diferencia (establecida
+      vs rechazada) cambia por completo la gravedad de una alerta.
+
+  - id: e3
+    section: "Ejemplo 3 — DNS que exfiltra datos (tunneling)"
+    format: markdown
+    body: |-
+      ```text
+      2026-09-14T11:02:31Z dns01 query: A www.google.com from 10.10.4.31 -> NOERROR
+      2026-09-14T11:02:33Z dns01 query: TXT Y29udHJhc2VuaGFzLXVzdWFyaW8tZHVtcC1wYXJ0ZTE.cdn-update.exfil-c2.net from 10.10.4.31 -> NOERROR
+      2026-09-14T11:02:34Z dns01 query: TXT cGFydGUyLWRlbC1kdW1wLWRlLWxhLWJhc2UtZGUtZGF0b3M.cdn-update.exfil-c2.net from 10.10.4.31 -> NOERROR
+      ```
+
+      Banderas rojas:
+      - Consultas **TXT** (raras en navegación normal)
+      - Subdominios larguísimos en **base64** (decodifica el primero:
+        `contraseñas-usuario-dump-parte1` 😱)
+      - Volumen alto y secuencial desde el mismo host interno
+      - Dominio base de baja reputación
+
+      Este patrón = **exfiltración por DNS tunneling**. Acción real: aislar
+      el host, preservar evidencia, buscar el proceso que genera las queries,
+      reportar como incidente confirmado.
+
+exercises:
+  - id: l1-e1
+    type: multiple_choice
+    prompt: "¿A qué capa del modelo OSI pertenece un SEGMENTO TCP?"
+    tags: [osi, tcp]
+    difficulty: 1
+    points: 10
+    options:
+      - id: a
+        text: "Capa 3 — Red"
+      - id: b
+        text: "Capa 4 — Transporte"
+      - id: c
+        text: "Capa 2 — Enlace de datos"
+      - id: d
+        text: "Capa 7 — Aplicación"
+    answer: "b"
+    explanation: >-
+      TCP opera en la capa 4 (Transporte) y su unidad de datos es el segmento.
+      En capa 3 viajan paquetes (IP), en capa 2 tramas (Ethernet).
+    hint: "Piensa en la mnemotecnia: All People Seem To Need... ¿cuál es la cuarta palabra?"
+
+  - id: l1-e2
+    type: matching
+    prompt: "Asocia cada servicio con su puerto por defecto (los clásicos de entrevista):"
+    tags: [puertos, protocolos]
+    difficulty: 1
+    points: 15
+    pairs:
+      - left_id: s1
+        left: "SSH"
+        right_id: p1
+        right: "22"
+      - left_id: s2
+        left: "DNS"
+        right_id: p2
+        right: "53"
+      - left_id: s3
+        left: "HTTPS"
+        right_id: p3
+        right: "443"
+      - left_id: s4
+        left: "RDP"
+        right_id: p4
+        right: "3389"
+      - left_id: s5
+        left: "SMB"
+        right_id: p5
+        right: "445"
+    answer: {s1: p1, s2: p2, s3: p3, s4: p4, s5: p5}
+    explanation: >-
+      22/SSH, 53/DNS, 443/HTTPS, 3389/RDP y 445/SMB son los cinco que más
+      verás en alertas reales. SMB(445) y RDP(3389) expuestos a Internet son
+      los dos hallazgos más peligrosos y comunes.
+
+  - id: l1-e3
+    type: ordering
+    prompt: "Ordena los pasos del three-way handshake TCP:"
+    tags: [tcp, handshake]
+    difficulty: 1
+    points: 10
+    items:
+      - id: h1
+        text: "El servidor responde SYN-ACK"
+      - id: h2
+        text: "El cliente envía ACK y la conexión queda establecida"
+      - id: h3
+        text: "El cliente envía SYN"
+    answer: [h3, h1, h2]
+    explanation: >-
+      SYN (cliente) → SYN-ACK (servidor) → ACK (cliente). Si en un log ves
+      SYN pero nunca el ACK final del cliente, la conexión no se estableció.
+
+  - id: l1-e4
+    type: multiple_choice
+    prompt: "Analiza este evento de firewall. ¿Cuál es la interpretación más precisa?"
+    context:
+      format: log
+      body: |-
+        Sep 15 02:41:07 fw01 kernel: [UFW BLOCK] IN=eth0 OUT=
+        SRC=45.155.205.99 DST=192.168.10.4 LEN=44 TTL=52 ID=2233
+        PROTO=TCP SPT=51820 DPT=3389 WINDOW=1024 SYN URGP=0
+        Sep 15 02:41:08 fw01 kernel: [UFW BLOCK] IN=eth0 OUT=
+        SRC=45.155.205.99 DST=192.168.10.5 LEN=44 TTL=52 ID=2234
+        PROTO=TCP SPT=51821 DPT=3389 WINDOW=1024 SYN URGP=0
+        Sep 15 02:41:09 fw01 kernel: [UFW BLOCK] IN=eth0 OUT=
+        SRC=45.155.205.99 DST=192.168.10.6 LEN=44 TTL=52 ID=2235
+        PROTO=TCP SPT=51822 DPT=3389 WINDOW=1024 SYN URGP=0
+    tags: [logs-firewall, rdp, escaneos]
+    difficulty: 2
+    points: 15
+    options:
+      - id: a
+        text: "Tráfico normal: varios usuarios remotos iniciando sesión por escritorio remoto"
+      - id: b
+        text: "Una IP externa intenta conectar a RDP (3389) en varias IPs internas seguidas; todo bloqueado. Patrón de escaneo/búsqueda de escritorios remotos expuestos"
+      - id: c
+        text: "Un ataque DoS volumétrico en curso contra el firewall"
+      - id: d
+        text: "Falso positivo: el puerto de origen es efímero, así que es tráfico interno legítimo"
+    answer: "b"
+    explanation: >-
+      Misma IP externa → distintas IPs internas, mismo puerto destino 3389
+      (RDP), segundos consecutivos, todos BLOCK con solo SYN. Es barrido en
+      busca de RDP expuesto (antesala típica de brute-force y ransomware).
+      No es DoS (volumen minúsculo) ni tráfico legítimo (viene de Internet
+      hacia un servicio de gestión). Acción: verificar que 3389 no esté
+      publicado, revisar si algún intento anterior logró conexión (ALLOW).
+
+  - id: l1-e5
+    type: fill_blank
+    prompt: "Completa: el registro DNS de tipo ____ es el más abusado para exfiltrar datos mediante DNS tunneling, porque permite empaquetar texto arbitrario en la respuesta. (3 letras)"
+    tags: [dns, exfiltracion]
+    difficulty: 2
+    points: 10
+    answer:
+      accepted: ["TXT", "txt"]
+      case_sensitive: false
+    explanation: >-
+      Los registros TXT devuelven texto libre y se usan legítimamente para
+      SPF/DKIM. Los atacantes los aprovechan para "sacar" datos codificados
+      (base64/hex) en las respuestas DNS.
+    hint: "También se usa para verificar dominios en SPF y DKIM..."
+
+  - id: l1-e6
+    type: multiple_select
+    prompt: "¿Cuáles de estas observaciones en logs/capturas son indicadores de un ESCANEO DE PUERTOS? (selecciona todas las que apliquen)"
+    tags: [escaneos, tcp]
+    difficulty: 2
+    points: 15
+    options:
+      - id: a
+        text: "Decenas de paquetes SYN desde una misma IP a distintos puertos del mismo host, en pocos segundos"
+      - id: b
+        text: "Conexiones SYN sin ACK final (half-open) que terminan en RST"
+      - id: c
+        text: "Una sesión HTTPS de 20 minutos con transferencia continua de datos"
+      - id: d
+        text: "El mismo host interno consultando DNS para 'www.google.com' cada pocos minutos"
+      - id: e
+        text: "SYN secuenciales a una misma IP variando solo el puerto destino (21, 22, 23, 25, 80...)"
+    answer: [a, b, e]
+    explanation: >-
+      a/b/e son la firma clásica de nmap (-sS deja half-opens). Una sesión
+      HTTPS larga es tráfico normal; consultas DNS periódicas a dominios
+      conocidos también (telemetría). Ojo: consultas DNS *masivas a dominios
+      extraños* sí serían indicador... de otra cosa (tunneling/DGA).
+
+  - id: l1-e7
+    type: fill_blank
+    prompt: "En la salida de tcpdump, completa los flags: 'Flags [___]' significa SYN; 'Flags [___]' significa SYN-ACK; 'Flags [___]' significa solo ACK. (usa S, A, F, R y punto; formato exacto del ejemplo: [S], [S.], [.])"
+    context:
+      format: log
+      body: |-
+        10:15:01.123456 IP 192.168.1.15.52344 > 93.184.216.34.443: Flags [S], seq 1234567
+        10:15:01.234567 IP 93.184.216.34.443 > 192.168.1.15.52344: Flags [S.], seq 7654321, ack 1234568
+        10:15:01.234890 IP 192.168.1.15.52344 > 93.184.216.34.443: Flags [.], ack 1
+    tags: [tcpdump, tcp]
+    difficulty: 2
+    points: 12
+    text: "SYN = [___1] · SYN-ACK = [___2] · ACK = [___3]"
+    answer:
+      blanks:
+        - accepted: ["S"]
+          case_sensitive: true
+        - accepted: ["S."]
+          case_sensitive: true
+        - accepted: ["."]
+          case_sensitive: true
+    explanation: >-
+      tcpdump abrevia: S=SYN, S.=SYN+ACK, .=ACK, P.=PSH+ACK, F.=FIN+ACK,
+      R=RST. El punto representa el ACK.
+
+  - id: l1-e8
+    type: free_text
+    prompt: "Eres N1 de guardia. En el log del DNS corporativo ves que la workstation WS-FIN-03 (contabilidad) generó 1.400 consultas en 10 minutos, la mayoría tipo TXT con subdominios de ~60 caracteres en base64 hacia 'sync-cdn-analytics.com', dominio registrado hace 3 días. En 2-4 frases: ¿qué está pasando probablemente, qué verificas y qué haces?"
+    context:
+      format: log
+      body: |-
+        11:02:31 dns01 query: TXT Y29udHJhc2VuaGFzLXVzdWFyaW8.cdn1.sync-cdn-analytics.com from 10.10.4.31 -> NOERROR
+        11:02:33 dns01 query: TXT cGFydGUyLWRlbC1kdW1w.cdn1.sync-cdn-analytics.com from 10.10.4.31 -> NOERROR
+        (... 1.398 consultas similares en 10 minutos ...)
+    tags: [dns, triage, exfiltracion]
+    difficulty: 3
+    points: 20
+    answer:
+      model_answer: >-
+        Probable exfiltración de datos por DNS tunneling (posible malware con
+        C2 en el host de contabilidad). Verifico: decodificar subdominios,
+        reputación del dominio (VirusTotal/AbuseIPDB), qué proceso genera las
+        queries en el endpoint, si el usuario reconoce actividad. Acciones:
+        bloquear el dominio en el resolver/firewall, aislar el host, preservar
+        evidencia, escalar como incidente (no es falso positivo típico) y
+        documentar IoCs (dominio, IP del NS, hashes).
+      keywords:
+        - "tunneling"
+        - "exfiltración"
+        - "bloquear"
+        - "aislar"
+        - "reputación"
+        - "escalar"
+        - "proceso"
+        - "IoC"
+      min_keywords: 3
+    explanation: >-
+      Puntos clave: identificar tunneling/exfiltración (no "navegación rara"),
+      validar con threat intel + proceso en el endpoint, contener (bloquear
+      dominio, aislar host) y escalar documentando IoCs. Mencionar decodificar
+      base64 es bonus de pro.

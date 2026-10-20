@@ -1,0 +1,340 @@
+id: fase-1-examen
+course_id: soc-n1
+module_id: 01-fundamentos
+title: "Examen Fase 1 — Fundamentos de redes y seguridad"
+description: >-
+  Evaluación integral de las 3 lecciones de la Fase 1. 15 preguntas, 30
+  minutos, aprobación con 70%. Al terminar recibes feedback automático por
+  pregunta, áreas débiles por tema y un reporte exportable en Markdown para
+  pedir feedback profundo a tu IA/mentor. Intentos ilimitados: cada intento
+  queda registrado para que veas tu mejora.
+time_limit_minutes: 30
+pass_score: 70
+attempts_allowed: null
+
+questions:
+  - id: ex-01
+    type: multiple_choice
+    prompt: "¿Cuál es la unidad de datos (PDU) de la capa 3 (Red) del modelo OSI?"
+    tags: [osi]
+    difficulty: 1
+    points: 8
+    options:
+      - id: a
+        text: "Segmento"
+      - id: b
+        text: "Trama (frame)"
+      - id: c
+        text: "Paquete"
+      - id: d
+        text: "Bit"
+    answer: "c"
+    explanation: >-
+      Capa 3 (Red, IP) = paquete. Segmento es capa 4 (TCP), trama es capa 2
+      (Ethernet) y bit es capa 1.
+
+  - id: ex-02
+    type: fill_blank
+    prompt: "Completa: el puerto por defecto de HTTPS es ____ y el de SSH es ____."
+    tags: [puertos]
+    difficulty: 1
+    points: 8
+    text: "HTTPS = [___1] · SSH = [___2]"
+    answer:
+      blanks:
+        - accepted: ["443"]
+        - accepted: ["22"]
+    explanation: "HTTPS 443/tcp, SSH 22/tcp. Memoria muscular obligatoria del N1."
+
+  - id: ex-03
+    type: matching
+    prompt: "Asocia cada flag de tcpdump con su significado:"
+    tags: [tcp, tcpdump]
+    difficulty: 2
+    points: 10
+    pairs:
+      - left_id: f1
+        left: "Flags [S]"
+        right_id: m1
+        right: "Solicitud de conexión (SYN)"
+      - left_id: f2
+        left: "Flags [S.]"
+        right_id: m2
+        right: "Aceptación de la conexión (SYN-ACK)"
+      - left_id: f3
+        left: "Flags [F.]"
+        right_id: m3
+        right: "Cierre ordenado (FIN-ACK)"
+      - left_id: f4
+        left: "Flags [R]"
+        right_id: m4
+        right: "Reset abrupto: conexión rechazada o rota"
+    answer: {f1: m1, f2: m2, f3: m3, f4: m4}
+    explanation: >-
+      S=SYN, S.=SYN+ACK, F.=FIN+ACK, R=RST. El punto siempre representa ACK.
+      Reconocer [S] sin respuesta vs [R] inmediato te dice si el puerto está
+      filtrado o cerrado.
+
+  - id: ex-04
+    type: multiple_choice
+    prompt: "En el log del firewall ves: 30 paquetes SYN desde 198.51.100.7 hacia 10.1.1.5 en 4 segundos, con puertos destino 21, 22, 23, 25, 53, 80, 110, 135, 139, 443, 445, 1433, 3306, 3389... ¿Qué está ocurriendo?"
+    tags: [escaneos, tcp]
+    difficulty: 2
+    points: 10
+    options:
+      - id: a
+        text: "Una sesión de trabajo normal de un usuario que abre muchas aplicaciones"
+      - id: b
+        text: "Un escaneo de puertos: una IP externa barre puertos conocidos de un host interno en busca de servicios expuestos"
+      - id: c
+        text: "Un ataque de denegación de servicio volumétrico"
+      - id: d
+        text: "Un error de configuración del firewall que duplica paquetes"
+    answer: "b"
+    explanation: >-
+      SYNs en secuencia de puertos conocidos desde un único origen en segundos
+      = escaneo de puertos (firma de nmap). No es volumétrico (30 paquetes no
+      saturan nada) y las sesiones legítimas no contactan 14 puertos distintos
+      de un mismo host en 4 segundos.
+
+  - id: ex-05
+    type: fill_blank
+    prompt: "Completa: el handshake TCP de 3 vías comienza cuando el cliente envía un paquete con flag ____."
+    tags: [tcp, handshake]
+    difficulty: 1
+    points: 6
+    answer:
+      accepted: ["SYN", "syn", "S"]
+    explanation: "SYN → SYN-ACK → ACK. Sin SYN no hay conversación TCP."
+
+  - id: ex-06
+    type: multiple_choice
+    prompt: "¿Qué registro DNS devuelve la dirección IPv6 de un dominio?"
+    tags: [dns]
+    difficulty: 1
+    points: 6
+    options:
+      - id: a
+        text: "A"
+      - id: b
+        text: "AAAA"
+      - id: c
+        text: "CNAME"
+      - id: d
+        text: "MX"
+    answer: "b"
+    explanation: >-
+      A = IPv4, AAAA = IPv6 (cuatro A por las 4 veces más direcciones),
+      CNAME = alias, MX = servidores de correo.
+
+  - id: ex-07
+    type: multiple_select
+    prompt: "¿Cuáles son indicadores de posible DNS tunneling/exfiltración? (todas las que apliquen)"
+    tags: [dns, exfiltracion]
+    difficulty: 2
+    points: 10
+    options:
+      - id: a
+        text: "Subdominios muy largos con cadenas tipo base64/hex"
+      - id: b
+        text: "Consultas masivas de tipo TXT desde un solo host interno"
+      - id: c
+        text: "Resoluciones normales de dominios conocidos como microsoft.com o google.com"
+      - id: d
+        text: "Alta tasa de NXDOMAIN desde un mismo host (posible DGA)"
+      - id: e
+        text: "Consultas hacia un dominio registrado hace pocos días, catalogado como de baja reputación"
+    answer: [a, b, d, e]
+    explanation: >-
+      Todo menos C: resolver dominios conocidos es el funcionamiento normal de
+      DNS. Los cuatro indicadores restantes aparecen en los casos reales de
+      tunneling (datos en subdominios, TXT, beaconing) y de malware con DGA
+      (NXDOMAIN masivos).
+
+  - id: ex-08
+    type: multiple_choice
+    prompt: "En un log de proxy web ves decenas de '401 Unauthorized' seguidos de un '200 OK' en /api/login desde la misma IP. ¿Lectura correcta?"
+    tags: [http, brute-force]
+    difficulty: 2
+    points: 10
+    options:
+      - id: a
+        text: "Comportamiento normal: el navegador reintenta automáticamente hasta conectar"
+      - id: b
+        text: "Posible brute-force de credenciales web que TUVO ÉXITO en el último intento: hay que verificar qué cuenta hizo login y desde dónde"
+      - id: c
+        text: "Error del servidor: devuelve 401 cuando debería devolver 500"
+      - id: d
+        text: "Un escaneo de puertos en la capa de aplicación"
+    answer: "b"
+    explanation: >-
+      Muchos 401 (credenciales rechazadas) + un 200 final = contraseña
+      encontrada. Es la versión web del 'Accepted password' tras 80 fallos en
+      SSH. Acción: identificar la cuenta, revisar la IP (¿externa? ¿otro
+      país?), forzar reset, buscar acciones posteriores de esa sesión.
+
+  - id: ex-09
+    type: multiple_choice
+    prompt: "Un atacante modifica las facturas almacenadas en el sistema contable sin robar datos ni tirar el servicio. ¿Qué dimensión de la triada CIA se vulneró principalmente?"
+    tags: [cia]
+    difficulty: 1
+    points: 8
+    options:
+      - id: a
+        text: "Confidencialidad"
+      - id: b
+        text: "Integridad"
+      - id: c
+        text: "Disponibilidad"
+      - id: d
+        text: "Ninguna: si no hubo robo ni caída, no es incidente"
+    answer: "b"
+    explanation: >-
+      Alteración no autorizada de datos = ruptura de Integridad, y puede ser
+      gravísimo (fraude, decisiones con datos falsos, evidencia contaminada).
+
+  - id: ex-10
+    type: multiple_select
+    prompt: "¿Cuáles de estos son indicios TÉCNICOS de phishing en un correo? (todas las que apliquen)"
+    tags: [phishing]
+    difficulty: 2
+    points: 10
+    options:
+      - id: a
+        text: "Received-SPF: Fail en las cabeceras"
+      - id: b
+        text: "Reply-To pointing a un gmail.com cuando el From es corporativo"
+      - id: c
+        text: "El enlace visible dice 'portal.empresa.com' pero el href real apunta a 91.240.118.50"
+      - id: d
+        text: "El correo tiene un saludo genérico y sentido de urgencia"
+      - id: e
+        text: "Adjunto .xlsm con macros, en un correo que supuestamente es una 'factura en PDF'"
+    answer: [a, b, c, e]
+    explanation: >-
+      La opción D es ingeniería social (indicio conductual, no técnico): un
+      correo legítimo de marketing también usa urgencia y saludos genéricos.
+      SPF fail, Reply-To desviado, href≠texto y macros disfrazadas son
+      evidencia técnica verificable.
+
+  - id: ex-11
+    type: multiple_choice
+    prompt: "Malware que cifra los archivos del equipo y exige un pago, habiendo exfiltrado previamente copia de los datos, se clasifica como:"
+    tags: [malware]
+    difficulty: 1
+    points: 8
+    options:
+      - id: a
+        text: "Spyware"
+      - id: b
+        text: "Ransomware de doble extorsión"
+      - id: c
+        text: "Adware"
+      - id: d
+        text: "Worm"
+    answer: "b"
+    explanation: >-
+      Doble extorsión: cifrado (rompe Disponibilidad) + robo de datos con
+      amenaza de publicación (rompe Confidencialidad). Es el modelo dominante
+      desde ~2020 (Maze, Conti, LockBit...).
+
+  - id: ex-12
+    type: fill_blank
+    prompt: "Completa el comando que muestra los sockets TCP y UDP en escucha, numéricos y con su proceso: ss -____"
+    tags: [comandos, linux]
+    difficulty: 2
+    points: 8
+    answer:
+      accepted: ["tulpn", "tulnp", "-tulpn", "-tulnp"]
+    explanation: >-
+      ss -tulpn (t=TCP, u=UDP, l=listening, p=proceso, n=numérico). El orden
+      de los flags no importa; también vale la variante antigua netstat -tulpn.
+
+  - id: ex-13
+    type: multiple_choice
+    prompt: "En /var/log/auth.log: 60 'Failed password' desde 185.220.101.34 y después 'Accepted password for admin from 185.220.101.34'. Tu PRIMERA acción como N1 es:"
+    tags: [brute-force, logs-linux, respuesta]
+    difficulty: 2
+    points: 10
+    options:
+      - id: a
+        text: "Cerrar el ticket como brute-force bloqueado por la política de contraseñas"
+      - id: b
+        text: "Tratarlo como compromiso confirmado: escalar de inmediato, mientras verificas qué hizo la sesión (sudo, comandos) y preservas los logs"
+      - id: c
+        text: "Reiniciar el servidor para cortar la sesión del atacante"
+      - id: d
+        text: "Enviar un correo al usuario admin preguntando si fue él"
+    answer: "b"
+    explanation: >-
+      Fallos + éxito desde la misma IP = cuenta comprometida. Prioridad:
+      escalar (es incidente, no ruido), preservar evidencia y reconstruir la
+      sesión. Reiniciar (C) destruye evidencia en memoria y no expulsa al
+      atacante si tiene persistencia; preguntar al usuario (D) viene DESPUÉS,
+      y cerrar el ticket (A) es el error que aparece en los post-mortems.
+
+  - id: ex-14
+    type: ordering
+    prompt: "Ordena el flujo de triage de una alerta que sigue un analista N1:"
+    tags: [triage, proceso]
+    difficulty: 2
+    points: 10
+    items:
+      - id: t1
+        text: "Enriquecer: buscar IoCs (IPs, hashes, dominios) en threat intelligence"
+      - id: t2
+        text: "Leer y entender la alerta: qué regla saltó, sobre qué evento"
+      - id: t3
+        text: "Clasificar: falso positivo, verdadero positivo/benigno, o incidente"
+      - id: t4
+        text: "Documentar y, si es incidente, escalar con línea de tiempo e IoCs"
+      - id: t5
+        text: "Recolectar contexto: logs alrededor del evento en el host/red afectada"
+    answer: [t2, t5, t1, t3, t4]
+    explanation: >-
+      Entender → contexto → enriquecimiento intel → veredicto → documentar/
+      escalar. Este ciclo es exactamente el trabajo diario del N1 y lo que te
+      pedirán describir en la entrevista ("walk me through how you triage an
+      alert").
+
+  - id: ex-15
+    type: free_text
+    prompt: "Caso de síntesis (respuesta libre, se incluye en tu reporte para revisión): a las 03:12 detectas escaneo de puertos desde 203.0.113.77 hacia srv-app01; a las 03:40, login SSH exitoso desde esa misma IP; a las 03:55, el proceso 'updater' (PID 3137) abre conexión saliente a 185.141.63.12:4444. En 4-6 frases: reconstruye la historia del ataque, indica en qué fase de la kill chain está y lista tus 3 primeras acciones concretas."
+    tags: [triage, incidentes, kill-chain]
+    difficulty: 3
+    points: 18
+    answer:
+      model_answer: >-
+        Historia: reconocimiento/escaneo (Reconnaissance) → credenciales
+        adivinadas o reutilizadas que dieron acceso inicial vía SSH (Initial
+        Access, T1078 Valid Accounts / T1110 Brute Force) → ahora hay un
+        proceso con conexión saliente al puerto 4444: comando y control activo
+        (C2), es decir el atacante ya tiene control remoto del servidor;
+        probable siguiente paso: movimiento lateral o exfiltración. Acciones:
+        1) Declarar incidente y escalar YA (compromiso confirmado con C2
+        activo). 2) Contener: aislar srv-app01 de la red (sin apagarlo:
+        preservar memoria/evidencia), bloquear 203.0.113.77 y
+        185.141.63.12:4444 en el perímetro, deshabilitar la cuenta usada.
+        3) Preservar y recolectar evidencia: hash del binario 'updater' +
+        VirusTotal, captura de las conexiones, logs de auth/proceso, cron y
+        persistencia; luego erradicar y revisar qué más tocó la sesión.
+      keywords:
+        - "escaneo"
+        - "brute"
+        - "C2"
+        - "comando y control"
+        - "4444"
+        - "aislar"
+        - "bloquear"
+        - "escalar"
+        - "evidencia"
+        - "hash"
+        - "persistencia"
+        - "incidente"
+      min_keywords: 5
+    explanation: >-
+      Se evalúa que: reconozcas las 3 fases (recon → acceso inicial → C2
+      activo), lo clasifiques como incidente confirmado (no intento), y tus
+      acciones sigan el orden correcto: escalar, contener SIN destruir
+      evidencia, preservar/analizar. Mencionar MITRE (T1078/T1110/T1071) suma
+      puntos en entrevistas reales.

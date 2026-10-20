@@ -1,0 +1,37 @@
+id: 01-wireshark
+module_id: 03-herramientas
+course_id: soc-n1
+title: Análisis de tráfico con Wireshark
+kind: herramienta
+estimated_minutes: 180
+status: draft
+summary: Capturar y filtrar paquetes. Detectar escaneos de puertos, exfiltración de datos y credenciales
+  en texto plano. PCAPs de CTFs.
+objectives:
+- Dominar filtros de captura y de visualización de Wireshark
+- Seguir streams TCP/UDP/HTTP y extraer artefactos
+- Resolver PCAPs de investigación (CTF/Blue Team Labs)
+theory:
+- id: t1
+  section: Contenido en construcción
+  format: markdown
+  body: 'Esta lección forma parte del roadmap del curso y su contenido detallado
+
+    está **en construcción** (igual que la Fase 1: teoría + ejemplos + ejercicios
+
+    + feedback).
+
+
+    **Contenido planeado:** UI de Wireshark, filtros (display vs capture), follow stream, estadísticas,
+    ejercicios con pcaps públicos de malware/CTF, detección de credenciales en claro.
+
+
+    Mientras tanto, puedes adelantar con los recursos recomendados del módulo.
+
+    Cuando esté publicada, esta tarjeta se habilitará automáticamente: la
+
+    plataforma detecta el cambio de `status: draft` a `status: published` sin
+
+    tocar código.'
+examples: []
+exercises: []

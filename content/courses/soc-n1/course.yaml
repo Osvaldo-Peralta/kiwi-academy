@@ -1,0 +1,24 @@
+id: soc-n1
+title: "Analista SOC — Nivel 1 (N1)"
+description: >-
+  Plan de estudios interactivo para conseguir tu primera vacante como SOC
+  Analyst N1. Diseñado para desarrolladores backend Python/JS sin experiencia
+  previa en ciberseguridad: teoría breve, ejemplos reales de logs, ejercicios
+  con feedback inmediato y exámenes por fase.
+language: es
+level: beginner
+estimated_weeks: "24-40"
+tags: [soc, blue-team, ciberseguridad, n1]
+modules:
+  - 01-fundamentos
+  - 02-deteccion
+  - 03-herramientas
+  - 04-entrevista
+meta:
+  perfil: "Dev backend Python/JS sin experiencia en ciberseguridad"
+  dedicacion: "5+ horas por semana (ritmo acelerado)"
+  meta: "Primera vacante como SOC Analyst N1"
+  ventaja_dev: >-
+    Tu experiencia en Python y APIs no es un bonus — es un diferenciador real.
+    Muchos analistas SOC N1 no saben programar. Automatizar búsquedas de IoCs o
+    parsear logs con scripts te pone por delante de la mayoría de candidatos.

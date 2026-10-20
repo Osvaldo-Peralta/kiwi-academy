@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# Node
+node_modules/
+
+# Datos de usuario (progreso, intentos, reportes): NO se versionan.
+# Cada estudiante/deployment genera los suyos.
+data/users/*
+!data/users/.gitkeep
+
+# Entorno
+.env
+
+# Editores / SO
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Build
+dist/

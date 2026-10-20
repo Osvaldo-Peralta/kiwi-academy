@@ -1,0 +1,37 @@
+id: 03-cv-portfolio-simulacros
+module_id: 04-entrevista
+course_id: soc-n1
+title: CV, portfolio y simulacros de entrevista
+kind: practica
+estimated_minutes: 180
+status: draft
+summary: Destacar scripting, labs resueltos y proyectos Python orientados a seguridad. Preparar respuestas
+  para preguntas típicas SOC N1.
+objectives:
+- Construir un CV orientado a SOC N1 sin experiencia formal previa
+- Publicar tu portfolio (GitHub + write-ups + scripts)
+- Responder con soltura las 20 preguntas típicas de entrevista N1
+theory:
+- id: t1
+  section: Contenido en construcción
+  format: markdown
+  body: 'Esta lección forma parte del roadmap del curso y su contenido detallado
+
+    está **en construcción** (igual que la Fase 1: teoría + ejemplos + ejercicios
+
+    + feedback).
+
+
+    **Contenido planeado:** Plantillas de CV, banco de 20 preguntas con respuestas modelo evaluables (free_text
+    + auto-revisión), simulacro cronometrado final, guión de storytelling de labs.
+
+
+    Mientras tanto, puedes adelantar con los recursos recomendados del módulo.
+
+    Cuando esté publicada, esta tarjeta se habilitará automáticamente: la
+
+    plataforma detecta el cambio de `status: draft` a `status: published` sin
+
+    tocar código.'
+examples: []
+exercises: []

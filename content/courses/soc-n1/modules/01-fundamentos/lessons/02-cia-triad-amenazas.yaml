@@ -1,0 +1,531 @@
+id: 02-cia-triad-amenazas
+module_id: 01-fundamentos
+course_id: soc-n1
+title: "Triada CIA y amenazas comunes"
+kind: teoria
+estimated_minutes: 120
+status: published
+summary: >-
+  Confidencialidad, Integridad y Disponibilidad: el marco para evaluar el
+  impacto de cualquier incidente. Más el catálogo de ataques que verás a
+  diario: phishing, malware, MITM, DoS y SQL injection — ahora desde el lado
+  del que los DETECTA.
+objectives:
+  - "Clasificar el impacto de un incidente según la triada CIA"
+  - "Distinguir amenaza, vulnerabilidad y riesgo (vocabulario de entrevistas)"
+  - "Reconocer la anatomía de un phishing y sus IoCs en cabeceras"
+  - "Identificar las familias de malware y su cadena de infección"
+  - "Detectar indicios de MITM, DoS y SQL injection en logs"
+  - "Entender qué es IoC, IoA y TTP (y la Pirámide del Dolor)"
+
+theory:
+  - id: t1
+    section: "La triada CIA: tu brújula de impacto"
+    format: markdown
+    body: |-
+      Todo programa de seguridad protege tres propiedades. Toda pregunta de
+      "¿qué tan grave es este incidente?" se responde con ellas:
+
+      - **Confidencialidad (C):** que la información solo la vea quien debe.
+        Se rompe con: exfiltración de datos, robo de credenciales, exposición
+        de BD, ransomware (también rompe C: los atacantes *leen* antes de cifrar).
+      - **Integridad (I):** que la información no sea alterada indebidamente.
+        Se rompe con: defacement web, manipulación de registros/transferencias,
+        troyanización de software, alteración de logs (anti-forense).
+      - **Disponibilidad (A):** que el servicio funcione cuando se necesita.
+        Se rompe con: ransomware (cifra = no disponible), DoS/DDoS, borrado
+        de backups, sabotaje, fallos no maliciosos también cuentan.
+
+      **En triage:** clasificar el impacto en CIA determina la urgencia y a
+      quién escalar. "Un servidor web caído" (A) no es lo mismo que "fuga de
+      la tabla de clientes" (C) — aunque ambos sean "graves", activan runbooks
+      y obligaciones legales distintas.
+
+      *(Algunos agregan una cuarta letra: AAA — Autenticación, Autorización,
+      Accounting — pero CIA es el canon de entrevista.)*
+
+  - id: t2
+    section: "Vocabulario exacto: amenaza, vulnerabilidad, riesgo, IoC, IoA, TTP"
+    format: markdown
+    body: |-
+      En entrevistas se nota muchísimo si usas estos términos con precisión:
+
+      - **Amenaza (threat):** actor/evento que puede causar daño (grupo de
+        ransomware, insider, desastre natural).
+      - **Vulnerabilidad (vulnerability):** debilidad explotable (CVE sin
+        parchar, contraseña por defecto, puerto expuesto).
+      - **Riesgo (risk):** amenaza × vulnerabilidad × impacto. "Tenemos RIESGO
+        de que un ransomware (amenaza) entre por RDP expuesto (vulnerabilidad)
+        y pare la operación (impacto)".
+      - **IoC (Indicador de Compromiso):** evidencia *post-incidente*: hash de
+        malware, IP de C2, dominio malicioso, mutex, tarea programada rara.
+        Se buscan con threat intelligence (VirusTotal, AbuseIPDB, feeds).
+      - **IoA (Indicador de Ataque):** señal de *intención* en curso, más
+        temprana y difícil de evadir: "procesos que inyectan en otros",
+        "movimiento lateral con psexec".
+      - **TTP (Tácticas, Técnicas y Procedimientos):** el *cómo* opera el
+        adversario. Es el nivel más alto de la **Pirámide del Dolor**:
+
+      ```text
+              TTPs            <- difícil de cambiar para el atacante (cazar aquí)
+            Herramientas
+          Artefactos de red
+        Nombres de dominio
+            Direcciones IP
+              Hashes          <- fácil de cambiar (bloqueo barato pero efímero)
+      ```
+
+      Bloquear un hash te protege de *ese* binario; detectar el TTP
+      ("Outlook lanza powershell con -enc") te protege de la *familia de
+      conducta*. De ahí la importancia de MITRE ATT&CK (lo verás en Fase 4).
+
+  - id: t3
+    section: "Phishing: el vector #1 (y cómo lo ve un analista)"
+    format: markdown
+    body: |-
+      La mayoría de intrusiones empiezan por un correo. Variantes:
+      - **Phishing:** masivo y genérico ("su paquete no pudo entregarse").
+      - **Spear-phishing:** dirigido a una persona/rol, con contexto real.
+      - **Whaling:** a ejecutivos.
+      - **BEC (Business Email Compromise):** suplantar a un directivo/proveedor
+        para ordenar transferencias. Sin malware: pura ingeniería social.
+      - **Credential harvesting:** página falsa de login (Microsoft 365 falsa)
+        que roba la contraseña al teclearla.
+
+      **Anatomía del engaño (checklist de triage de correo):**
+      1. **Remitente:** display name de confianza ≠ dirección real.
+         `Soporte Empresa <soporte@empresa-seguridad.com>` cuando la empresa
+         es `empresa.com`. O dominios *lookalike*: `rnicrosoft.com` (rn≈m).
+      2. **Reply-To distinto del From:** las respuestas del usuario van al
+         atacante.
+      3. **Autenticación de correo:** en las cabeceras busca
+         `Received-SPF: Fail`, `DKIM=fail`, `DMARC=fail`. Un correo "de tu
+         banco" que falla SPF es phishing casi seguro. (Ojo: spoofing *interno*
+         puede pasar SPF si el atacante comprometió una cuenta legítima.)
+      4. **Urgencia/miedo/curiosidad:** "se suspenderá en 24h", "factura
+         vencida", "foto tuya".
+      5. **Enlaces:** texto del link ≠ href real. Pasa el mouse (o lee el log
+         del proxy: ¿a qué dominio fue el click?). URLs con IP, dominios nuevos,
+         acortadores, redirecciones abiertas.
+      6. **Adjuntos:** `.xlsm`/`.docm` (macros), `.iso`/`.img`/`.zip` con `.lnk`
+         o `.exe` dentro, `.html` que abre una página de login falsa, `.one`,
+         `.svg`. Extensión doble: `factura.pdf.exe`.
+
+      **Qué genera el phishing en tus logs:** click → GET al dominio falso en
+      el proxy (¡ahí lo ves!) → credenciales enviadas por POST → a menudo
+      descarga de malware (IoC: hash, dominio de distribución) → inicio de
+      sesión anómalo en M365 desde IP de otro país.
+
+  - id: t4
+    section: "Malware: familias y cadena de infección"
+    format: markdown
+    body: |-
+      **Familias principales:**
+
+      | Tipo | Qué hace | Señal típica en SOC |
+      |------|----------|---------------------|
+      | Ransomware | Cifra archivos + pide rescate; suele exfiltrar antes ("doble extorsión") | Notas de rescate, sombras borradas, EDR: cifrado masivo, renombra archivos |
+      | Infostealer | Roba credenciales, cookies, wallets (RedLine, Vidar...) | POST a dominios raros, accesos a rutas de navegadores |
+      | RAT | Control remoto del equipo | Beaconing periódico (conexiones regulares cada X min al mismo C2) |
+      | Troyano | Se disfraza de software legítimo | Ejecución desde Downloads/Temp con nombre inocente |
+      | Worm | Se autopropaga (red, USB) | Escaneo interno masivo SMB/RDP entre hosts |
+      | Rootkit/Bootkit | Oculta presencia a nivel SO/firmware | Detecciones que "desaparecen", inconsistencias |
+      | Cryptominer | Usa tu CPU para minar | CPU sostenida al 100%, pools de minería (stratum://) en proxy |
+
+      **Cadena de infección típica (y qué log la delata en cada paso):**
+      ```text
+      1. Entrega        -> correo con adjunto (mail gateway log)
+      2. Ejecución      -> Outlook/Word lanza proceso hijo raro (EDR/Sysmon)
+      3. Persistencia   -> Run keys, tareas programadas, servicios (EDR)
+      4. C2             -> beaconing a dominio/IP externa (proxy/firewall/DNS)
+      5. Acciones       -> descubrimiento local, movimiento lateral,
+                           exfiltración, cifrado (EDR, DNS, NetFlow)
+      ```
+      Como N1 rara vez analizarás el binario (eso es malware analysis, otro
+      rol), pero SÍ detectarás los pasos 2, 4 y 5 en logs. El **beaconing**
+      (conexiones cada N segundos exactos al mismo destino) es una de las
+      firmas más buscadas y más detectables.
+
+  - id: t5
+    section: "MITM: el atacante en el medio"
+    format: markdown
+    body: |-
+      En un ataque Man-in-the-Middle el tráfico entre A y B pasa (y se
+      manipula) por el atacante:
+
+      - **ARP spoofing:** en red local, el atacante responde "yo soy el
+        gateway" (ARP no autentica). Víctimas envían su tráfico al atacante.
+        *Señales:* IPs MAC distintas respondiendo por la misma IP, duplicados
+        MAC/IP en la tabla ARP, switches con MAC flapping.
+      - **DNS spoofing / rogue DNS:** respuestas DNS falsas → la víctima va
+        al sitio del atacante. *Señal:* respuestas que no vienen del resolver
+        configurado; usuario jura que "el banco se veía raro" (certificado).
+      - **Rogue Access Point / Evil Twin:** Wi-Fi con SSID legítimo ("Starbucks
+        WiFi") montado por el atacante. *Señal:* mismo SSID con BSSID/MAC
+        desconocido, potencia anómala.
+      - **SSL strip:** degrada HTTPS→HTTP para leer en claro. *Señal:* tráfico
+        a puerto 80 hacia sitios que sabes que son HTTPS-only; ausencia de HSTS.
+
+      Con TLS bien usado (certificados válidos + HSTS), el MITM moderno se
+      enfoca en robar *sesiones/cookies* o en engañar al usuario con
+      certificados autofirmados que el usuario acepta. Como dev sabes que un
+      `CERTIFICATE_VERIFY_FAILED` en tu cliente no es "un bug molesto": en
+      una red corporativa puede ser MITM activo.
+
+  - id: t6
+    section: "DoS/DDoS: tumbar la disponibilidad"
+    format: markdown
+    body: |-
+      **Objetivo:** agotar recursos (ancho de banda, conexiones, CPU) para que
+      el servicio no responda. Rompe la **A** de CIA.
+
+      | Tipo | Capa | Mecánica | Firma en logs |
+      |------|------|----------|---------------|
+      | SYN flood | 4 (L4) | SYNs sin completar el handshake; llena la tabla de conexiones half-open | Miles de SYN sin ACK, mismos puertos destino |
+      | UDP/ICMP flood | 3/4 | Volumen bruto | Tráfico masivo uniforme |
+      | Amplificación/reflexión | 3/4 | Pide respuestas grandes a servidores públicos (DNS, NTP, memcached) usando tu IP falsificada | Respuestas enormes desde puertos 53/123/11211 hacia la víctima |
+      | HTTP flood | 7 (L7) | Requests "legítimas" (GET/, POST /login) a gran volumen | Peticiones/s anómalas, UA genéricos, IPs de bots/proxies |
+      | Low & slow (Slowloris) | 7 | Pocas conexiones mantenidas a medias, headers incompletos | Pocas IPs con conexiones larguísimas de bajo tráfico |
+
+      **DDoS = distribuido:** desde una botnet (miles de hosts infectados) o
+      servicios de alquiler ("booters/stressers").
+
+      **Qué hace el SOC N1:** confirmar (¿volumétrico vs aplicación?),
+      identificar fuente y tipo, escalar al equipo de red/ISP/proveedor
+      anti-DDoS (Cloudflare, AWS Shield...), documentar línea de tiempo.
+      *No confundir:* un pico legítimo de tráfico (Black Friday, viral en
+      redes) también dispara alertas — verificar origen y patrón antes de
+      declarar incidente.
+
+  - id: t7
+    section: "SQL Injection: ya la conoces como dev — mírala como defensor"
+    format: markdown
+    body: |-
+      Sabes cómo se produce (concatenar input del usuario en la query) y cómo
+      se previene (queries parametrizadas/ORM). En el SOC tu trabajo es
+      **detectarla en los logs**:
+
+      **Firmas clásicas en access logs / WAF:**
+      - `' OR '1'='1`, `' OR 1=1 --`, `admin'--` (bypass de autenticación)
+      - `UNION SELECT`, `UNION ALL SELECT NULL,NULL,...` (extracción de datos)
+      - `'; DROP TABLE`, `xp_cmdshell`, `INTO OUTFILE` (acciones destructivas)
+      - Time-based: `SLEEP(5)`, `WAITFOR DELAY`, `pg_sleep(10)` — si la
+        respuesta tarda exactamente +5s, la inyección funcionó
+      - Errores de BD en la respuesta: `SQL syntax`, `mysql_fetch`, `ORA-01756`
+      - User-Agents de herramientas: `sqlmap/1.x`, `Nikto`, `Havij`
+      - Secuencias URL-encoded: `%27` ('), `%20%4F%52%20` (OR), `0x...`
+
+      **Correlación que confirma éxito:** request con payload → respuesta
+      **200 con tamaño anómalo** (volcó datos) o **500** (rompió la query),
+      seguido de más requests variando el payload (explotación activa, no un
+      escáner pasando de largo).
+
+      **Respuesta N1:** confirmar si la app es vulnerable (¿hubo 200 con
+      datos?), preservar logs, notificar al equipo de la app para parchar
+      (parametrizar), bloquear IP en WAF, revisar accesos posteriores a datos.
+      Reportar como incidente si hay evidencia de extracción.
+
+  - id: t8
+    section: "MITRE ATT&CK y Cyber Kill Chain: el idioma común del SOC"
+    format: markdown
+    body: |-
+      Dos frameworks para *narrar* ataques (los verás a fondo en Fase 4; aquí
+      la introducción para que empieces a asociar):
+
+      **Cyber Kill Chain (Lockheed Martin)** — 7 fases lineales del ataque:
+      Reconocimiento → Armamento → Entrega → Explotación → Instalación →
+      Comando y Control → Acciones sobre objetivos.
+      Útil para entender "en qué fase lo detuvimos".
+
+      **MITRE ATT&CK** — matriz de **tácticas** (el *por qué*: Initial Access,
+      Execution, Persistence, ... Exfiltration, Impact) y **técnicas** (el
+      *cómo*, con ID estable). Ejemplos reales que ya puedes leer:
+      - `T1566.001` Phishing: Spearphishing Attachment
+      - `T1059.001` Command and Scripting: PowerShell
+      - `T1078` Valid Accounts (usar credenciales robadas)
+      - `T1071.004` Application Layer Protocol: DNS (¡tunneling!)
+      - `T1486` Data Encrypted for Impact (ransomware)
+
+      **Por qué te conviene desde ya:** en entrevistas y en tickets reales se
+      habla así: "tenemos un T1110.001 (brute-force password guessing) desde
+      esta IP contra SSH". Asociar lo que ves en logs con IDs de ATT&CK es
+      exactamente lo que busca un hiring manager en un N1.
+
+examples:
+  - id: e1
+    section: "Ejemplo 1 — Autopsia de un correo de phishing"
+    format: markdown
+    body: |-
+      ```text
+      From:        "Soporte TI — Empresa" <soporte@empresa-seguridad.com>
+      Reply-To:    soporte.ti.empresa@gmail.com
+      Return-Path: bounces@mail-sender-random.xyz
+      Received-SPF: Fail (domain of empresa-seguridad.com does not designate
+                    185.234.72.10 as permitted sender)
+      DKIM:        none
+      DMARC:       fail
+      Subject:     URGENTE: su cuenta sera suspendida en 24 horas
+
+      Estimado usuario,
+      Detectamos actividad inusual. Verifique inmediatamente su acceso en:
+      http://empresa-seguridad.com/verificar   <- href real: http://185.234.72.10/portal/login.php
+      Adjunto: Notificacion_093124.xlsm
+      ```
+
+      Hallazgos (cada uno suma certeza):
+      1. **SPF Fail + DKIM none + DMARC fail** → el remitente miente
+      2. **Reply-To a gmail.com** → las respuestas van al atacante
+      3. Display name "Soporte TI — Empresa" pero dominio `empresa-seguridad.com`
+         (no es `empresa.com`): lookalike
+      4. **href ≠ texto del enlace** → apunta directo a una IP
+      5. Urgencia artificial ("24 horas")
+      6. Adjunto **.xlsm** (macros habilitadas)
+
+      Veredicto: phishing de credenciales + posible dropper de malware.
+      IoCs a registrar: IP 185.234.72.10, dominio empresa-seguridad.com,
+      hash del adjunto (lo calculas con `sha256sum` y lo buscas en VirusTotal),
+      dirección gmail del Reply-To.
+      Acción: reportar, bloquear remitente/IP/dominio, buscar en logs de proxy
+      y de correo **quién más lo recibió y quién hizo click**.
+
+  - id: e2
+    section: "Ejemplo 2 — SQL injection en un access log de Apache"
+    format: markdown
+    body: |-
+      ```text
+      10.20.1.15 - - [14/Sep/2026:09:12:31 +0000] "GET /productos?id=42 HTTP/1.1" 200 5121 "-" "sqlmap/1.7.2#stable (https://sqlmap.org)"
+      10.20.1.15 - - [14/Sep/2026:09:12:33 +0000] "GET /productos?id=42'+AND+1=1-- HTTP/1.1" 200 5121 "-" "sqlmap/1.7.2#stable"
+      10.20.1.15 - - [14/Sep/2026:09:12:34 +0000] "GET /productos?id=42'+AND+1=2-- HTTP/1.1" 200 498 "-" "sqlmap/1.7.2#stable"
+      10.20.1.15 - - [14/Sep/2026:09:12:40 +0000] "GET /productos?id=42'+UNION+SELECT+NULL,username,password+FROM+users-- HTTP/1.1" 500 342 "-" "sqlmap/1.7.2#stable"
+      10.20.1.15 - - [14/Sep/2026:09:13:02 +0000] "GET /productos?id=42'+UNION+SELECT+NULL,username,password+FROM+users-- HTTP/1.1" 200 84212 "-" "sqlmap/1.7.2#stable"
+      ```
+
+      Lectura de analista:
+      - **UA = sqlmap**: herramienta automatizada de SQLi. Con eso solo ya es
+        incidente (o al menos intento deliberado).
+      - Líneas 2-3: detección **boolean-based** (`1=1` vs `1=2`): si las
+        respuestas difieren (5121 bytes vs 498), la app **es inyectable**.
+      - Línea 4: `UNION SELECT ... FROM users` falló (500) → el atacante
+        ajustó columnas.
+      - Línea 5: misma query con **200 y 84 KB** (vs 5 KB normal) →
+        **extrajo la tabla de usuarios**. Confirmado: brecha de
+        confidencialidad (C).
+      - ATT&CK: `T1190` (Exploit Public-Facing Application).
+
+      Acciones: bloquear IP en WAF, preservar logs, avisar al equipo de la app
+      (parametrizar queries), forzar reset de credenciales de los usuarios
+      expuestos, verificar si las contraseñas venían hasheadas, escalar como
+      incidente de datos (posible obligación legal de notificar).
+
+exercises:
+  - id: l2-e1
+    type: matching
+    prompt: "Asocia cada escenario con la dimensión de la triada CIA que se ve comprometida PRIMARIAMENTE:"
+    tags: [cia]
+    difficulty: 1
+    points: 12
+    pairs:
+      - left_id: sc1
+        left: "Un atacante exfiltra la base de datos de clientes"
+        right_id: c1
+        right: "Confidencialidad"
+      - left_id: sc2
+        left: "Ransomware cifra los servidores de producción"
+        right_id: c3
+        right: "Disponibilidad"
+      - left_id: sc3
+        left: "Un atacante modifica los precios publicados en el e-commerce"
+        right_id: c2
+        right: "Integridad"
+      - left_id: sc4
+        left: "Borrado de logs para ocultar la intrusión"
+        right_id: c2b
+        right: "Integridad (de la evidencia)"
+    answer: {sc1: c1, sc2: c3, sc3: c2, sc4: c2b}
+    explanation: >-
+      Exfiltración = C; cifrado/borrado = A (aunque el ransomware moderno
+      también rompe C por la doble extorsión); manipulación de datos o de
+      evidencia = I. En entrevistas matiza: muchos incidentes rompen varias
+      dimensiones, se clasifica por la PRIMARIA.
+
+  - id: l2-e2
+    type: multiple_choice
+    prompt: "Revisas las cabeceras de un correo reportado por un usuario. ¿Cuál es el indicador MÁS fuerte de que es phishing?"
+    context:
+      format: log
+      body: |-
+        From: "RRHH Empresa" <rrhh@empresa-oficial.com>
+        Reply-To: rrhh.empresa2026@gmail.com
+        Received-SPF: Fail (sender IP 91.240.118.50 not permitted)
+        DKIM-Signature: (ausente)
+        Subject: Actualizacion obligatoria de datos - vence hoy
+    tags: [phishing, correo]
+    difficulty: 2
+    points: 10
+    options:
+      - id: a
+        text: "El asunto menciona urgencia ('vence hoy')"
+      - id: b
+        text: "Received-SPF: Fail combinado con Reply-To a un gmail.com"
+      - id: c
+        text: "El From muestra un display name amigable 'RRHH Empresa'"
+      - id: d
+        text: "Que el usuario lo haya reportado"
+    answer: "b"
+    explanation: >-
+      La urgencia y el display name son tácticas de ingeniería social (indicios
+      débiles, un correo legítimo puede tenerlos). SPF Fail + Reply-To externo
+      es evidencia técnica dura: el remitente no está autorizado y las
+      respuestas se desvían al atacante. Reportar no es indicador en sí mismo
+      (hay falsos positivos reportados).
+
+  - id: l2-e3
+    type: multiple_select
+    prompt: "Del mismo correo del ejercicio anterior y su adjunto 'Nómina_Septiembre.xlsm', ¿cuáles son IoCs que deberías registrar y buscar en la organización? (todas las que apliquen)"
+    tags: [iocs, phishing]
+    difficulty: 2
+    points: 15
+    options:
+      - id: a
+        text: "Hash SHA-256 del adjunto .xlsm"
+      - id: b
+        text: "IP del remitente: 91.240.118.50"
+      - id: c
+        text: "Dominio del enlace incluido y direcciones del Reply-To"
+      - id: d
+        text: "El hecho de que el asunto tenga faltas de ortografía"
+      - id: e
+        text: "El nombre del archivo ('Nómina_Septiembre.xlsm')"
+    answer: [a, b, c]
+    explanation: >-
+      IoC = artefacto observable y buscable: hashes, IPs, dominios, URLs,
+      cuentas. Las faltas de ortografía son un *indicio* cualitativo (sirve
+      para awareness, no para cazar en logs). El nombre del archivo es débil:
+      los atacantes lo cambian trivialmente (parte baja de la Pirámide del
+      Dolor... en realidad ni siquiera está en la pirámide).
+
+  - id: l2-e4
+    type: fill_blank
+    prompt: "En el access log de Apache ves requests con User-Agent '____/1.7.2#stable (https://...)' probando payloads 'OR 1=1--'. Completa el nombre de la herramienta de inyección SQL automatizada más famosa:"
+    tags: [sqli, logs-web, herramientas]
+    difficulty: 1
+    points: 10
+    answer:
+      accepted: ["sqlmap"]
+    explanation: >-
+      sqlmap deja su User-Agent por defecto (a menos que se use --random-agent).
+      Verlo en logs = alguien está intentando SQLi automatizado contra tu app.
+
+  - id: l2-e5
+    type: ordering
+    prompt: "Ordena la cadena de infección típica de malware (de la entrega al daño final):"
+    tags: [malware, kill-chain]
+    difficulty: 2
+    points: 12
+    items:
+      - id: s1
+        text: "Ejecución (la víctima abre el adjunto / corre el binario)"
+      - id: s2
+        text: "C2 — beaconing periódico al servidor del atacante"
+      - id: s3
+        text: "Entrega (correo phishing con adjunto, descarga drive-by)"
+      - id: s4
+        text: "Acciones sobre objetivos (exfiltración, cifrado, movimiento lateral)"
+      - id: s5
+        text: "Persistencia (Run keys, tareas programadas, servicios)"
+    answer: [s3, s1, s5, s2, s4]
+    explanation: >-
+      Entrega → Ejecución → Persistencia → C2 → Acciones. Es la Kill Chain
+      aplicada a malware. Como N1, los puntos donde más detectarás son
+      Ejecución (EDR), Persistencia (EDR) y C2 (proxy/DNS/firewall: beaconing).
+
+  - id: l2-e6
+    type: multiple_choice
+    prompt: "Un ataque DDoS inunda al servidor con paquetes SYN y nunca completa el handshake. ¿Qué tipo de ataque es y qué recurso agota principalmente?"
+    tags: [dos, tcp]
+    difficulty: 2
+    points: 10
+    options:
+      - id: a
+        text: "HTTP flood; agota los workers de la aplicación web"
+      - id: b
+        text: "SYN flood; agota la tabla de conexiones half-open del servidor"
+      - id: c
+        text: "Amplificación DNS; agota el ancho de banda con respuestas gigantes"
+      - id: d
+        text: "Slowloris; agota el ancho de banda con descargas lentas"
+    answer: "b"
+    explanation: >-
+      SYN sin ACK final = conexiones half-open que ocupan entradas en la tabla
+      de conexiones (backlog) hasta que expiran; con suficiente volumen, el
+      servidor no acepta conexiones legítimas. Mitigaciones: SYN cookies,
+      rate-limiting, scrubbing del proveedor. Slowloris también es de
+      conexiones a medias, pero a nivel 7 (headers incompletos, pocas IPs).
+
+  - id: l2-e7
+    type: multiple_choice
+    prompt: "¿Cuál es la diferencia correcta entre IoC y TTP según la Pirámide del Dolor?"
+    tags: [iocs, ttp, threat-intel]
+    difficulty: 2
+    points: 10
+    options:
+      - id: a
+        text: "Los IoCs (hashes, IPs) son baratos de detectar pero el atacante los cambia fácil; los TTPs describen conductas que le cuestan más cambiar"
+      - id: b
+        text: "Los TTPs son indicadores observables en logs; los IoCs son los procedimientos del atacante"
+      - id: c
+        text: "Son sinónimos; la pirámide ordena IoCs por tamaño"
+      - id: d
+        text: "Los IoCs solo aplican a malware y los TTPs solo a phishing"
+    answer: "a"
+    explanation: >-
+      En la base de la pirámide: hashes/IPs/dominios = fáciles de rotar para
+      el atacante (bloqueo efímero). En la cima: comportamientos (TTPs) =
+      caros de cambiar. Por eso la detección moderna (EDR, reglas Sigma,
+      threat hunting) caza comportamientos: 'Word lanza PowerShell con
+      payload ofuscado' sigue siendo T1059 aunque cambien todos los hashes.
+
+  - id: l2-e8
+    type: free_text
+    prompt: "Triage este escenario en 3-5 frases: el WAF registra 400 requests en 2 minutos desde 203.0.113.9 con payloads de SQLi contra /login. Todas devolvieron 403 excepto DOS que devolvieron 200 con tamaños de respuesta 10 veces mayores a lo normal. ¿Qué concluyes, qué haces y cómo lo clasificas en CIA y en MITRE ATT&CK?"
+    context:
+      format: log
+      body: |-
+        09:12:01 POST /login user=admin'-- -> 403 (WAF block)
+        09:12:02 POST /login user=admin' OR '1'='1 -> 403 (WAF block)
+        (... 396 requests similares, todas 403 ...)
+        09:13:55 POST /login user=x' UNION SELECT card,exp,cvv FROM payments-- -> 200 (48211 bytes)
+        09:14:12 POST /login user=x' UNION SELECT card,exp,cvv FROM payments-- -> 200 (51003 bytes)
+    tags: [sqli, triage, cia, mitre]
+    difficulty: 3
+    points: 20
+    answer:
+      model_answer: >-
+        Los 403 muestran al WAF bloqueando el ataque automatizado, pero las dos
+        respuestas 200 con tamaño anómalo tras un UNION SELECT sobre 'payments'
+        indican que esos payloads SÍ alcanzaron la app y probablemente
+        extrajeron datos de tarjetas: incidente confirmado de confidencialidad
+        (C), no simple intento. MITRE: T1190 Exploit Public-Facing Application.
+        Acciones: bloquear IP 203.0.113.9, preservar logs/WAF, notificar al
+        equipo de la app (el WAF no cubre todo: parametrizar), revisar BD de
+        pagos y accesos, escalar como brecha de datos (posible notificación
+        legal/PCI-DSS), cazar otras IPs con el mismo patrón y revisar por qué
+        esas 2 requests evadieron el WAF.
+      keywords:
+        - "200"
+        - "extracción"
+        - "confidencialidad"
+        - "T1190"
+        - "bloquear"
+        - "preservar"
+        - "parametrizar"
+        - "escalar"
+        - "WAF"
+        - "brecha"
+      min_keywords: 4
+    explanation: >-
+      La clave del ejercicio: no quedarse con 'el WAF lo bloqueó' (396 veces
+      sí), sino notar las 2 respuestas 200 anómalas = evasión exitosa +
+      probable extracción. Clasificación: impacto en Confidencialidad,
+      T1190 en ATT&CK. Un N1 que detecta ese matiz demuestra pensamiento
+      de analista, no solo de lector de alertas.

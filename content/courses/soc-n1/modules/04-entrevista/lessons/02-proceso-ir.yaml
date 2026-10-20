@@ -1,0 +1,37 @@
+id: 02-proceso-ir
+module_id: 04-entrevista
+course_id: soc-n1
+title: Proceso de respuesta a incidentes (IR)
+kind: teoria
+estimated_minutes: 120
+status: draft
+summary: 'Las 6 fases del IR: Preparación, Identificación, Contención, Erradicación, Recuperación y Lecciones
+  aprendidas. Construir un runbook de ejemplo.'
+objectives:
+- Describir las 6 fases de IR (NIST SP 800-61) con ejemplos
+- Entender roles, severidades y comunicación en un incidente
+- Escribir un runbook básico para un escenario (phishing/brute-force)
+theory:
+- id: t1
+  section: Contenido en construcción
+  format: markdown
+  body: 'Esta lección forma parte del roadmap del curso y su contenido detallado
+
+    está **en construcción** (igual que la Fase 1: teoría + ejemplos + ejercicios
+
+    + feedback).
+
+
+    **Contenido planeado:** NIST vs SANS, severidad/priorización, chain of custody, runbooks, ejercicios
+    de simulación de mesa (tabletop) con escenarios escritos.
+
+
+    Mientras tanto, puedes adelantar con los recursos recomendados del módulo.
+
+    Cuando esté publicada, esta tarjeta se habilitará automáticamente: la
+
+    plataforma detecta el cambio de `status: draft` a `status: published` sin
+
+    tocar código.'
+examples: []
+exercises: []

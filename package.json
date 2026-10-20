@@ -1,0 +1,13 @@
+{
+  "name": "soc-academy-frontend-tests",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Pruebas de humo del frontend (jsdom) — requieren el backend corriendo en localhost:8000",
+  "scripts": {
+    "test:frontend": "node tests/frontend_smoke.mjs"
+  },
+  "devDependencies": {
+    "jsdom": "^24.0.0"
+  }
+}

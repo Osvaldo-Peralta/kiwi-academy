@@ -1,0 +1,26 @@
+id: 01-fundamentos
+course_id: soc-n1
+title: "Fundamentos de redes y seguridad"
+phase: 1
+subtitle: "La base que todo analista SOC debe tener sólida"
+duration: "Meses 1-2"
+outcome: >-
+  Al terminar sabrás leer un log de red y entender qué está pasando en una
+  conexión sospechosa.
+lessons:
+  - 01-modelo-osi-protocolos
+  - 02-cia-triad-amenazas
+  - 03-linux-para-seguridad
+exam: fase-1-examen
+resources:
+  - title: "TryHackMe — Pre-Security Path (gratis)"
+    url: "https://tryhackme.com/path/outline/presecurity"
+    type: lab
+    note: "Recurso principal de esta fase"
+  - title: "Professor Messer — CompTIA Network+ (YouTube, gratis)"
+    url: "https://www.professormesser.com/network-plus/n10-008/n10-008-video/n10-008-training-course/"
+    type: video
+  - title: "NetworkChuck (YouTube)"
+    url: "https://www.youtube.com/@NetworkChuck"
+    type: video
+    note: "Redes de forma visual e interactiva"

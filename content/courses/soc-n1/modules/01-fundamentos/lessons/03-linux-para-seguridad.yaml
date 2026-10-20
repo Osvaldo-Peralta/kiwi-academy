@@ -1,0 +1,527 @@
+id: 03-linux-para-seguridad
+module_id: 01-fundamentos
+course_id: soc-n1
+title: "Linux básico para seguridad"
+kind: practica
+estimated_minutes: 150
+status: published
+summary: >-
+  La terminal como herramienta de análisis: logs en /var/log, pipelines de
+  grep/awk/sort/uniq para cazar patrones, estado de red con ss/netstat,
+  capturas con tcpdump, escaneos con nmap y hashes como IoC.
+objectives:
+  - "Saber qué log vive en qué archivo y cómo leer su formato"
+  - "Construir one-liners para contar/agrupar eventos (top IPs, fallos de login)"
+  - "Interpretar ss/netstat: estados, puertos y procesos"
+  - "Capturar y filtrar tráfico con tcpdump"
+  - "Entender qué ve una víctima cuando la escanean con nmap"
+  - "Generar y verificar hashes de archivos (IoCs)"
+
+theory:
+  - id: t1
+    section: "El mapa de /var/log: dónde vive cada pista"
+    format: markdown
+    body: |-
+      En Debian/Ubuntu (y casi igual en RHEL con otros nombres):
+
+      | Archivo | Qué registra | Búsquedas típicas SOC |
+      |---------|--------------|------------------------|
+      | `/var/log/auth.log` (Deb) / `/var/log/secure` (RHEL) | Autenticaciones: SSH, sudo, PAM | `Failed password`, `Accepted`, `sudo:`, `Invalid user` |
+      | `/var/log/syslog` (Deb) / `/var/log/messages` (RHEL) | Todo lo que no tiene archivo propio | contexto general de un servicio |
+      | `/var/log/kern.log` | Kernel: drivers, iptables/nftables (UFW BLOCK vive aquí o en syslog) | reglas de firewall |
+      | `/var/log/apache2/access.log` / `/var/log/nginx/access.log` | Requests web | SQLi, escaneo de rutas, 404 masivos |
+      | `/var/log/btmp` y `/var/log/wtmp` | Binarios: logins fallidos y exitosos | se leen con `lastb` y `last` |
+      | `/var/log/dpkg.log` / `/var/log/apt/history.log` | Software instalado | "¿qué se instaló la noche del incidente?" |
+
+      **Formato syslog clásico** (lo verás en todos lados):
+      ```text
+      Sep 14 03:12:01 srv01 sshd[4521]: Failed password for invalid user admin from 203.0.113.77 port 44231 ssh2
+      └─ fecha ──┘└hora┘ └host┘ └proc[pid]┘ └────────────── mensaje ──────────────┘
+      ```
+
+      **journalctl** (systemd) es la vista moderna y unificada:
+      - `journalctl -u ssh` → solo el servicio sshd
+      - `journalctl --since "2026-09-14 03:00" --until "2026-09-14 04:00"`
+      - `journalctl -f` → seguir en vivo (como `tail -f`)
+      - `journalctl _PID=4521` → todo lo que dijo ese proceso
+
+      **Regla de oro forense:** los logs son *evidencia*. En un incidente real
+      no los editas ni los "limpias"; los copias (`cp auth.log auth.log.bak`)
+      y trabajas sobre la copia. Y calcula su hash para cadena de custodia.
+
+  - id: t2
+    section: "Pipelines de análisis: grep + awk + sort + uniq, tu SIEM de bolsillo"
+    format: markdown
+    body: |-
+      Un SIEM hace search → aggregate → visualize. En la terminal, el 90% de
+      las investigaciones rápidas se resuelven con este pipeline mental:
+
+      ```text
+      FILTRAR (grep) -> EXTRAER campo (awk/cut) -> AGRUPAR (sort | uniq -c) -> ORDENAR (sort -rn)
+      ```
+
+      **Piezas:**
+      - `grep -E "Failed password" auth.log` → filtra líneas (-i ignora
+        mayúsculas, -c cuenta, -v invierte, -r recursivo)
+      - `awk '{print $11}'` → imprime la columna N (separador: espacio).
+        `$(NF-3)` = "cuarta columna empezando desde el final" (útil cuando
+        las columnas varían)
+      - `cut -d' ' -f11` → alternativa simple a awk
+      - `sort` → ordena (necesario antes de uniq)
+      - `uniq -c` → cuenta líneas consecutivas iguales
+      - `sort -rn` → ordena numérico descendente
+      - `head -10` / `tail -f` → top N / seguir el archivo en vivo
+
+      **Los 5 one-liners que todo N1 usa a diario:**
+      ```bash
+      # 1. Top 10 IPs con logins SSH fallidos
+      grep "Failed password" /var/log/auth.log | awk '{print $(NF-3)}' | sort | uniq -c | sort -rn | head -10
+
+      # 2. Usuarios más atacados en brute-force
+      grep "Invalid user" /var/log/auth.log | awk '{print $8}' | sort | uniq -c | sort -rn | head
+
+      # 3. ¿Hubo algún login EXITOSO desde las IPs atacantes?
+      grep "Accepted" /var/log/auth.log | grep -E "203.0.113.77|198.51.100.4"
+
+      # 4. Top IPs en el access log de nginx
+      awk '{print $1}' /var/log/nginx/access.log | sort | uniq -c | sort -rn | head -10
+
+      # 5. Requests que devolvieron 404 (rutas buscadas por escáneres)
+      awk '$9 == 404 {print $7}' /var/log/nginx/access.log | sort | uniq -c | sort -rn | head -20
+      ```
+
+      Como dev Python esto te va a resultar natural: es `filter().map().reduce()`
+      sobre texto. De hecho, cuando el pipeline se complica, se escribe un
+      script (Fase 3 está dedicada a eso).
+
+  - id: t3
+    section: "Estado de red: ss y netstat"
+    format: markdown
+    body: |-
+      `ss` (socket statistics) reemplazó a `netstat` (misma idea, más rápido).
+      La combinación canónica:
+
+      ```bash
+      ss -tulpn
+      #    ││││└─ n: numérico (no resuelve nombres/puertos)
+      #    │││└── p: muestra el PROCESO dueño del socket (requiere sudo)
+      #    ││└─── l: solo sockets en LISTENING
+      #    │└──── u: UDP
+      #    └───── t: TCP
+      ```
+
+      **Estados TCP que debes reconocer:**
+
+      | Estado | Significado | Lectura SOC |
+      |--------|-------------|-------------|
+      | LISTEN | Socket abierto esperando conexiones | ¿qué procesos escuchan? ¿en 0.0.0.0 (todo) o 127.0.0.1 (local)? |
+      | ESTAB | Conexión establecida | ¿hacia dónde? ¿el proceso tiene sentido? |
+      | SYN-SENT | SYN enviado, sin respuesta | conexión saliendo... o escaneo/timeout |
+      | SYN-RECV | Half-open recibida | ¿nos están escaneando? ¿SYN flood? |
+      | TIME-WAIT | Cerrada, esperando limpieza | normal tras muchas conexiones cortas |
+
+      **Banderas rojas en `ss -tulpn`:**
+      - Proceso LISTEN en `0.0.0.0:puerto` que no reconoces (peor: en 4444,
+        1337, o un puerto alto fijo) → posible backdoor/C2
+      - Base de datos escuchando en `0.0.0.0` en vez de `127.0.0.1`
+      - ESTAB hacia IP externa desde un proceso que no debería hablar afuera
+        (p.ej. `postgres` con conexión a Internet)
+      - Binarios en rutas raras: `/tmp`, `/dev/shm`, `/home/usuario/Downloads`
+
+      Para ver conexiones de UN proceso: `ss -tunp | grep pid=1234` o
+      `lsof -i -nP -p 1234`.
+
+  - id: t4
+    section: "tcpdump: capturar y filtrar paquetes"
+    format: markdown
+    body: |-
+      ```bash
+      # Capturar todo en eth0 (requiere sudo)
+      sudo tcpdump -i eth0
+
+      # Filtro BPF: solo tráfico al puerto 443 del host 93.184.216.34
+      sudo tcpdump -i eth0 'host 93.184.216.34 and port 443'
+
+      # Guardar a archivo PCAP (para Wireshark) — el flag CLAVE
+      sudo tcpdump -i eth0 -w captura.pcap 'port not 22'
+
+      # Leer un pcap guardado
+      tcpdump -r captura.pcap -n
+
+      # Útil: -n (no resolver DNS: más rápido, evita ruido),
+      # -c 100 (parar tras 100 paquetes), -A (ver payload ASCII),
+      # -tttt (timestamps legibles)
+      ```
+
+      **Sintaxis de filtros BPF (combinables con and/or/not):**
+      `host 10.0.0.5` · `net 10.0.0.0/24` · `port 53` · `portrange 1-1024`
+      · `src`/`dst` (`src host`, `dst port`) · `tcp`/`udp`/`icmp`
+      · flags: `tcp[tcpflags] & tcp-syn != 0` (SYNs)
+
+      **Qué puede ver un analista en una captura:**
+      - Handshakes y resets (¿la conexión prosperó?)
+      - Escaneos (SYN a puertos en secuencia)
+      - Credenciales en claro: FTP (USER/PASS), Telnet, HTTP Basic Auth,
+        logins POST en HTTP → hallazgo de seguridad inmediato
+      - Beaconing: paquetes pequeños y regulares al mismo destino
+      - Exfiltración: flujos salientes masivos (upload anómalo)
+
+      El PCAP es evidencia: guárdalo, hashealo (`sha256sum captura.pcap`),
+      documenta quién lo capturó y cuándo.
+
+  - id: t5
+    section: "nmap: del lado del que escanea (para entender al que te escanea)"
+    format: markdown
+    body: |-
+      ```bash
+      nmap -sS -sV -p- 10.0.2.15   # SYN scan + versiones + todos los puertos
+      #     │   │   └─ rango de puertos (-p- = los 65535; por defecto top 1000)
+      #     │   └───── detección de versión de servicio
+      #     └───────── SYN scan ("half-open"): rápido y discreto
+      nmap -sT 10.0.2.15           # connect scan: completa el handshake (queda en logs de la app)
+      nmap -sU 10.0.2.15           # UDP scan (lento: los closed responden ICMP unreachable)
+      nmap -sn 10.0.0.0/24         # solo descubre hosts (ping sweep)
+      nmap -O 10.0.2.15            # detección de SO (requiere root)
+      ```
+
+      **Resultados de puerto:** `open` (algo escucha), `closed` (host responde
+      RST), `filtered` (no responde: firewall en el camino), `open|filtered`
+      (típico de UDP scan sin respuesta).
+
+      **Cómo se ve un escaneo DESDE la víctima (esto es lo que te toca):**
+      - En el firewall: ráfaga de `[UFW BLOCK]` SYN a puertos variados desde
+        una IP, TTL similar, IDs incrementales
+      - En `ss`: muchas conexiones `SYN-RECV` fugaces
+      - En auth.log/web: si usa -sT, conexiones completas y desconexiones
+        inmediatas; requests raros sin UA
+
+      **Uso defensivo legítimo:** inventario ("¿qué tenemos expuesto?").
+      Escanear lo tuyo con permiso = bien; escanear lo ajeno = delito. En el
+      laboratorio usa siempre tus propias VMs o rangos de práctica
+      (TryHackMe, `scanme.nmap.org`).
+
+  - id: t6
+    section: "Hashes: el ADN de los archivos (IoC por excelencia)"
+    format: markdown
+    body: |-
+      ```bash
+      sha256sum archivo_sospechoso.xlsm
+      # 3a7bd3e2360a3d29eea436fcfb7e44c735d117c42d1c1835420b6b9942dd4f1b  archivo_sospechoso.xlsm
+      md5sum archivo_sospechoso.xlsm   # legacy; VirusTotal aún lo acepta
+      ```
+
+      Propiedades que los hacen útiles:
+      - **Determinista:** mismo contenido → mismo hash siempre
+      - **Avalancha:** cambiar 1 byte cambia TODO el hash
+      - **Irreversible:** del hash no recuperas el archivo
+
+      Flujo de analista N1:
+      1. `sha256sum` del binario/adjunto sospechoso
+      2. Buscarlo en **VirusTotal** (hash, no el archivo: subir un malware
+         activo a servicios públicos puede alertar al atacante de que lo
+         tienes — política de tu SOC)
+      3. Coincidencia conocida → IoC confirmado; buscarlo en TODA la flota
+         (`grep -r` del hash en logs de EDR, o `find / -type f -exec sha256sum {} \;`
+         en casos pequeños)
+      4. Sin coincidencia → no significa benigno (malware nuevo/packer).
+         Escalar a análisis más profundo.
+
+      Limitación honesta (Pirámide del Dolor): el atacante recompila y el
+      hash cambia. Por eso se complementa con hashes parciales (imphash),
+      certificados de firma y detección por comportamiento.
+
+examples:
+  - id: e1
+    section: "Ejemplo 1 — One-liner completo, campo por campo"
+    format: markdown
+    body: |-
+      Pregunta del lead: "¿Desde qué IPs nos están atacando SSH esta noche?"
+
+      ```bash
+      grep "Failed password" /var/log/auth.log | awk '{print $(NF-3)}' | sort | uniq -c | sort -rn | head -5
+      ```
+
+      ```text
+         1842 203.0.113.77
+          212 198.51.100.23
+           37 192.0.2.101
+           12 45.155.205.99
+            4 10.0.0.44        <- ¡IP INTERNA! Ojo: host interno atacando SSH
+      ```
+
+      Por qué `$(NF-3)`: en la línea
+      `... Failed password for invalid user admin from 203.0.113.77 port 44231 ssh2`
+      la IP es la antepenúltima-penúltima... concretamente: última=`ssh2`,
+      -2=`44231`, -3=`port`... depende del formato; aquí NF-3 cae en la IP
+      porque la línea termina `from <IP> port <puerto> ssh2` → NF=ssh2,
+      NF-1=puerto, NF-2=port, NF-3=IP. **Lección:** verifica siempre con un
+      `head -1` qué campo estás extrayendo antes de contar.
+
+      Hallazgo extra que un buen analista NO pasa por alto: la IP interna
+      10.0.0.44 también falla logins SSH → posible host comprometido haciendo
+      movimiento lateral. Eso escala el incidente.
+
+  - id: e2
+    section: "Ejemplo 2 — Interpretando ss -tulpn"
+    format: markdown
+    body: |-
+      ```text
+      $ sudo ss -tulpn
+      Netid State   Local Address:Port  Peer Address:Port  Process
+      tcp   LISTEN  0.0.0.0:22          0.0.0.0:*          users:(("sshd",pid=812,fd=3))
+      tcp   LISTEN  127.0.0.1:5432      0.0.0.0:*          users:(("postgres",pid=940,fd=5))
+      tcp   LISTEN  0.0.0.0:4444        0.0.0.0:*          users:(("svc_update",pid=3137,fd=4))
+      tcp   ESTAB   10.0.2.15:52100     45.77.65.211:443   users:(("firefox",pid=2210,fd=88))
+      tcp   ESTAB   10.0.2.15:44110     185.141.63.12:4444 users:(("svc_update",pid=3137,fd=7))
+      udp   UNCONN  0.0.0.0:68          0.0.0.0:*          users:(("dhclient",pid=701,fd=6))
+      ```
+
+      Lectura línea por línea:
+      - `sshd` en 0.0.0.0:22 → normal en servidor (aunque: ¿debería aceptar
+        password auth desde Internet? revisa sshd_config)
+      - `postgres` en 127.0.0.1:5432 → BIEN: solo local
+      - `svc_update` LISTEN en 0.0.0.0:**4444** → 🔴 nombre genérico + puerto
+        de Metasploit por defecto + pid sospechoso (3137, guiño leet)
+      - `firefox` → 45.77.65.211:443 → normal (navegador a Internet)
+      - `svc_update` → 185.141.63.12:**4444** ESTAB → 🔴 conexión SALIENTE
+        establecida al mismo puerto raro: esto grita **C2/backdoor**
+      - `dhclient` udp/68 → normal (DHCP)
+
+      Siguientes pasos reales: `ls -l /proc/3137/exe` (ruta del binario),
+      `sha256sum` del binario + VirusTotal, `ps -fp 3137`, revisar
+      persistencia (`crontab -l`, systemd units, ~/.bashrc), aislar el host,
+      escalar. ¡NUNCA matar el proceso antes de preservar evidencia!
+
+  - id: e3
+    section: "Ejemplo 3 — De brute-force a compromiso: la línea que lo cambia todo"
+    format: markdown
+    body: |-
+      ```text
+      Sep 14 03:12:01 srv01 sshd[4521]: Failed password for invalid user admin from 203.0.113.77 port 44231 ssh2
+      Sep 14 03:12:03 srv01 sshd[4523]: Failed password for invalid user root from 203.0.113.77 port 44235 ssh2
+      Sep 14 03:12:05 srv01 sshd[4525]: Failed password for invalid user test from 203.0.113.77 port 44240 ssh2
+      Sep 14 03:12:07 srv01 sshd[4527]: Failed password for jdoe from 203.0.113.77 port 44244 ssh2
+      Sep 14 03:12:09 srv01 sshd[4530]: Accepted password for jdoe from 203.0.113.77 port 44251 ssh2
+      Sep 14 03:12:09 srv01 sshd[4530]: pam_unix(sshd:session): session opened for user jdoe
+      Sep 14 03:14:22 srv01 sudo: jdoe : TTY=pts/0 ; PWD=/home/jdoe ; USER=root ; COMMAND=/bin/bash
+      ```
+
+      Las 4 primeras líneas solas = brute-force (ruido diario, se monitorea).
+      La quinta cambia TODO: **`Accepted password for jdoe` desde la MISMA IP
+      atacante** → la contraseña cayó. Y 2 minutos después, `sudo` a root.
+
+      Esto ya no es "intento de ataque": es **compromiso confirmado con
+      escalada de privilegios**. Respuesta inmediata: revocar sesión
+      (`pkill -u jdoe`), resetear credenciales de jdoe (y auditar otras cuentas),
+      aislar srv01, bloquear 203.0.113.77 en el perímetro, revisar qué hizo
+      la sesión (history, archivos tocados, `last`, crons nuevos), buscar
+      movimiento lateral desde srv01, escalar a incidente.
+
+      Moraleja SOC: el contexto temporal convierte ruido en incidente.
+      Por eso los SIEMs correlacionan "N fallos + 1 éxito desde la misma IP"
+      (regla clásica de brute-force exitoso).
+
+exercises:
+  - id: l3-e1
+    type: fill_blank
+    prompt: "Completa: en Ubuntu/Debian, el archivo de log donde sshd registra los intentos de autenticación (Failed/Accepted password) es /var/log/______.log"
+    tags: [logs-linux]
+    difficulty: 1
+    points: 10
+    answer:
+      accepted: ["auth", "auth.log", "/var/log/auth.log"]
+    explanation: >-
+      /var/log/auth.log en Debian/Ubuntu; en RHEL/CentOS el equivalente es
+      /var/log/secure. Ambos registran SSH, sudo y PAM.
+    hint: "Empieza por 'auth'..."
+
+  - id: l3-e2
+    type: matching
+    prompt: "Asocia cada comando con su propósito en una investigación:"
+    tags: [comandos, linux]
+    difficulty: 1
+    points: 15
+    pairs:
+      - left_id: c1
+        left: "ss -tulpn"
+        right_id: u1
+        right: "Ver sockets en escucha con su proceso dueño"
+      - left_id: c2
+        left: "tcpdump -i eth0 -w cap.pcap"
+        right_id: u2
+        right: "Capturar tráfico de red a un archivo"
+      - left_id: c3
+        left: "sha256sum archivo"
+        right_id: u3
+        right: "Calcular el hash del archivo para buscarlo como IoC"
+      - left_id: c4
+        left: "lastb"
+        right_id: u4
+        right: "Listar intentos de login fallidos (lee /var/log/btmp)"
+      - left_id: c5
+        left: "journalctl -u nginx --since '10:00'"
+        right_id: u5
+        right: "Ver logs de un servicio systemd desde una hora"
+    answer: {c1: u1, c2: u2, c3: u3, c4: u4, c5: u5}
+    explanation: >-
+      Este quinteto cubre el ciclo de una investigación express: estado de red
+      (ss), evidencia de tráfico (tcpdump), identificación de archivos
+      (sha256sum), autenticaciones fallidas (lastb) y logs por servicio
+      (journalctl).
+
+  - id: l3-e3
+    type: ordering
+    prompt: "Ordena el pipeline que produce el 'top de IPs con logins SSH fallidos' (de izquierda a derecha en el one-liner):"
+    tags: [pipelines, logs-linux]
+    difficulty: 2
+    points: 12
+    items:
+      - id: p1
+        text: "sort  (agrupa líneas iguales de forma consecutiva)"
+      - id: p2
+        text: "grep \"Failed password\" /var/log/auth.log  (filtra las líneas)"
+      - id: p3
+        text: "head -10  (se queda con el top 10)"
+      - id: p4
+        text: "awk '{print $(NF-3)}'  (extrae el campo con la IP)"
+      - id: p5
+        text: "uniq -c  (cuenta repeticiones)"
+      - id: p6
+        text: "sort -rn  (ordena por conteo, descendente)"
+    answer: [p2, p4, p1, p5, p6, p3]
+    explanation: >-
+      grep → awk → sort → uniq -c → sort -rn → head. Recuerda: uniq solo
+      cuenta líneas CONSECUTIVAS iguales, por eso el sort previo es obligatorio.
+      Este pipeline es tu detector de brute-force de bolsillo.
+
+  - id: l3-e4
+    type: multiple_choice
+    prompt: "Según esta salida de ss, ¿cuál es el hallazgo MÁS preocupante?"
+    context:
+      format: log
+      body: |-
+        Netid State   Local Address:Port  Peer Address:Port  Process
+        tcp   LISTEN  0.0.0.0:22          0.0.0.0:*          users:(("sshd",pid=812,fd=3))
+        tcp   LISTEN  127.0.0.1:5432      0.0.0.0:*          users:(("postgres",pid=940,fd=5))
+        tcp   LISTEN  0.0.0.0:4444        0.0.0.0:*          users:(("updater",pid=3137,fd=4))
+        tcp   ESTAB   10.0.2.15:44110     185.141.63.12:4444 users:(("updater",pid=3137,fd=7))
+        udp   UNCONN  0.0.0.0:68          0.0.0.0:*          users:(("dhclient",pid=701,fd=6))
+    tags: [ss, c2, linux]
+    difficulty: 2
+    points: 15
+    options:
+      - id: a
+        text: "sshd escuchando en 0.0.0.0:22"
+      - id: b
+        text: "postgres escuchando solo en 127.0.0.1:5432"
+      - id: c
+        text: "El proceso 'updater' escucha en 0.0.0.0:4444 y mantiene conexión ESTAB hacia una IP externa en el puerto 4444"
+      - id: d
+        text: "dhclient con un socket UDP en el puerto 68"
+    answer: "c"
+    explanation: >-
+      4444 es el puerto por defecto de Metasploit; un proceso de nombre
+      genérico que ADEMÁS escucha en todas las interfaces y mantiene una
+      conexión saliente al mismo puerto hacia Internet es firma de
+      backdoor/C2. sshd en 22 es normal; postgres en localhost es la
+      configuración CORRECTA; dhclient en udp/68 es DHCP de manual.
+      Siguiente paso: /proc/3137/exe, hash a VirusTotal, aislar, escalar.
+
+  - id: l3-e5
+    type: multiple_choice
+    prompt: "En auth.log ves 80 líneas 'Failed password for invalid user' desde 203.0.113.77 y al final 'Accepted password for jdoe from 203.0.113.77'. ¿Interpretación correcta?"
+    tags: [brute-force, logs-linux]
+    difficulty: 2
+    points: 15
+    options:
+      - id: a
+        text: "Falso positivo: al final solo hay 1 login exitoso de un usuario legítimo"
+      - id: b
+        text: "Brute-force EXITOSO: la contraseña de jdoe fue adivinada desde la IP atacante; es un compromiso confirmado y se escala de inmediato"
+      - id: c
+        text: "Es un escaneo de puertos que nunca llegó a conectar"
+      - id: d
+        text: "El usuario jdoe se equivocó 80 veces y luego acertó; se le envía un recordatorio de contraseña"
+    answer: "b"
+    explanation: >-
+      La clave es el CONTEXTO: éxito desde la MISMA IP que generó los 80
+      fallos, contra un usuario existente ('for jdoe' sin 'invalid user'),
+      segundos después. Es la correlación clásica 'muchos fallos + 1 éxito
+      desde igual origen'. Ver ejemplo 3 de esta lección: compromisos así
+      suelen venir seguidos de sudo/escalada y movimiento lateral.
+
+  - id: l3-e6
+    type: multiple_select
+    prompt: "¿Cuáles de estos comandos/flags de tcpdump son correctos para lo que dicen? (todas las que apliquen)"
+    tags: [tcpdump, comandos]
+    difficulty: 2
+    points: 15
+    options:
+      - id: a
+        text: "-w captura.pcap guarda los paquetes en un archivo"
+      - id: b
+        text: "-r captura.pcap lee un archivo pcap guardado"
+      - id: c
+        text: "'host 10.0.0.5 and port 80' es un filtro BPF válido"
+      - id: d
+        text: "-n fuerza la resolución de nombres DNS para mostrar dominios"
+      - id: e
+        text: "-c 100 detiene la captura después de 100 paquetes"
+    answer: [a, b, c, e]
+    explanation: >-
+      -n hace lo CONTRARIO: desactiva la resolución DNS (más rápido y evita
+      que tu propio tcpdump genere tráfico DNS que contamine la captura).
+      El resto es correcto: -w escribe, -r lee, filtros BPF con and/or/not,
+      -c limita el conteo.
+
+  - id: l3-e7
+    type: fill_blank
+    prompt: "Completa el one-liner que cuenta cuántas veces aparece cada IP en la primera columna del access log de nginx:  awk '{print $1}' access.log | sort | ____ -c | sort -rn | head. (comando, 4 letras)"
+    tags: [pipelines, comandos, logs-web]
+    difficulty: 1
+    points: 10
+    answer:
+      accepted: ["uniq"]
+    explanation: >-
+      sort | uniq -c es EL dúo dinámico del agregado en terminal: uniq cuenta
+      líneas consecutivas idénticas y -c imprime el conteo. Sin el sort
+      previo, uniq no agrupa correctamente.
+
+  - id: l3-e8
+    type: free_text
+    prompt: "Escenario: en el servidor web srv-app01 detectas un archivo /tmp/.cache_update que nadie reconoce. Describe en 4-6 frases tu investigación paso a paso usando los comandos de esta lección (qué miras, en qué orden y qué te dice cada cosa)."
+    tags: [investigacion, linux, malware]
+    difficulty: 3
+    points: 20
+    answer:
+      model_answer: >-
+        1) Preservar evidencia: copiar el archivo y calcular sha256sum, buscar
+        el hash en VirusTotal. 2) Metadatos: ls -la (fechas, dueño, permisos;
+        un . en el nombre intenta ocultarlo), file /tmp/.cache_update (¿ELF?,
+        ¿script?). 3) ¿Está activo?: ps aux | grep cache_update, ss -tulpn y
+        ss -tunp | grep <pid> (¿escucha? ¿conexiones salientes a IPs raras?).
+        4) Persistencia: crontab -l, /etc/cron*, systemctl list-units,
+        ~/.bashrc, /etc/ld.so.preload. 5) Origen: grep en auth.log/nginx
+        alrededor de la fecha de creación del archivo (mtime), historial de
+        shells. 6) Contención: aislar el host (no borrar nada aún), escalar
+        con IoCs (hash, IPs, rutas) documentados.
+      keywords:
+        - "sha256"
+        - "VirusTotal"
+        - "ps"
+        - "ss"
+        - "crontab"
+        - "persistencia"
+        - "ls"
+        - "file"
+        - "aislar"
+        - "evidencia"
+        - "grep"
+      min_keywords: 4
+    explanation: >-
+      El orden importa: primero PRESERVAR (hash, no ejecutar, no borrar),
+      luego IDENTIFICAR (file, VT), luego VER SI ESTÁ VIVO (ps, ss), luego
+      PERSISTENCIA (cron, systemd), luego ORIGEN (logs de la fecha del
+      archivo), y por último CONTENER. Matar el proceso o borrar el archivo
+      antes de hashear y documentar destruye evidencia: error clásico de
+      novato que los entrevistadores adoran preguntar.
