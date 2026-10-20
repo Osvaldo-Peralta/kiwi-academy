@@ -19,12 +19,12 @@ from ..config import settings
 from ..core.errors import NotFoundError
 from ..core.models import Course, Exam, Lesson, Module
 from .base import ContentStore, ProgressStore
-from .json_store import JsonContentStore, JsonProgressStore
+from .factory import make_content_store, make_progress_store
 
 
 class ContentRepository:
     def __init__(self, store: Optional[ContentStore] = None):
-        self.store = store or JsonContentStore()
+        self.store = store or make_content_store()
         self._cache: dict[str, tuple[float, Any]] = {}
 
     def _cache_get(self, key: str) -> Optional[Any]:
@@ -109,7 +109,7 @@ class ContentRepository:
 
 class ProgressRepository:
     def __init__(self, store: Optional[ProgressStore] = None):
-        self.store = store or JsonProgressStore()
+        self.store = store or make_progress_store()
 
     def get_progress(self, user_id: str) -> dict[str, Any]:
         return self.store.load_progress(user_id)

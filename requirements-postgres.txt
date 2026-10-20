@@ -1,0 +1,4 @@
+# Driver Postgres (necesario SOLO si usas KIWI_DATABASE_URL=postgresql://...)
+# p.ej. Supabase, Neon, RDS...  En local con SQLite no hace falta nada extra.
+-r requirements.txt
+psycopg[binary]>=3.1

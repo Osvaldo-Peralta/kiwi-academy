@@ -21,7 +21,7 @@ globalThis.document = dom.window.document;
 globalThis.navigator = dom.window.navigator;
 globalThis.localStorage = dom.window.localStorage;
 // usuario único por corrida: test idempotente que no contamina estados previos
-dom.window.localStorage.setItem("socacademy.userId", `smoketest-${Date.now()}`);
+dom.window.localStorage.setItem("kiwi.userId", `smoketest-${Date.now()}`);
 globalThis.location = dom.window.location;
 globalThis.fetch = (url, opts) => realFetch(new URL(url, "http://127.0.0.1:8000"), opts);
 globalThis.confirm = () => true;

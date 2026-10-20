@@ -12,6 +12,9 @@ node_modules/
 # Cada estudiante/deployment genera los suyos.
 data/users/*
 !data/users/.gitkeep
+data/*.db
+data/*.db-wal
+data/*.db-shm
 
 # Entorno
 .env

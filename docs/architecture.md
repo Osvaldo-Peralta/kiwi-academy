@@ -86,19 +86,21 @@ decida.
 | Hoy (JSON/YAML archivos) | Mañana (sin reescribir negocio) |
 |---|---|
 | `content/**.yaml` en git | Misma estructura en tablas `courses/modules/lessons/exercises` + CMS propio, o seguir con git (recomendado: content-as-code) |
-| `data/users/<uid>/progress.json` | Tabla `user_progress` (una fila por usuario/lección) |
-| `data/users/<uid>/attempts/*.json` | Tabla `attempts` + `attempt_results` |
-| Locks por archivo + escritura atómica (tmp+fsync+replace) | Transacciones SQL |
+| `data/users/<uid>/progress.json` | ✅ **Ya disponible:** tabla `kiwi_progress` vía `SqlProgressStore` (`KIWI_DATABASE_URL=postgresql://...` o `sqlite:///...`) |
+| `data/users/<uid>/attempts/*.json` | ✅ **Ya disponible:** tabla `kiwi_attempts` (una fila por intento, mismo JSON) |
+| Locks por archivo + escritura atómica (tmp+fsync+replace) | Transacciones SQL (el driver ya hace commit por operación) |
 | Un proceso uvicorn local | N procesos/contenedores; el storage ya es stateless |
 
-Para migrar: implementar `SqlProgressStore(ProgressStore)` y cambiar una línea
-en `repositories.py` (o inyectar por configuración). Los servicios no cambian.
+La migración de datos existentes es un comando:
+`KIWI_DATABASE_URL=... python tools/migrate_json_to_sql.py` (idempotente).
+Para cambiar de backend de progreso solo cambia la variable de entorno — la
+fábrica (`storage/factory.py`) elige implementación; los servicios no cambian.
 
 **Rendimiento:** con archivos + caché de contenido, un proceso aguanta sin
-problema decenas de estudiantes activos. El cuello de botella real para
-"1000+/día" no es lectura de contenido (cacheable/CDN) sino escritura de
-intentos; ahí el salto a DB es el paso natural. 1000 estudiantes/día son
-~decenas de writes por minuto: Postgres/SQLite-WAL lo resuelven de sobra.
+problema decenas de estudiantes activos. Con `SqlProgressStore` + Postgres
+(Supabase pooler en serverless), la escritura de intentos deja de ser el
+cuello de botella: 1000 estudiantes/día son ~decenas de writes por minuto,
+trivial para Postgres.
 
 ## Frontend
 
@@ -129,20 +131,22 @@ producción. Aun así, se aplican las reglas correctas desde ya:
 - Escapeado de HTML en todo contenido renderizado (el YAML de contenido es
   de confianza, pero el renderer no confía: escapa antes de procesar).
 - Escrituras atómicas: un crash no corrompe tu progreso.
-- CORS configurable por env (`SOCACADEMY_CORS_ORIGINS`).
+- CORS configurable por env (`KIWI_CORS_ORIGINS`).
 
 Para producción hará falta: auth real (JWT), rate limiting, y mover `data/`
 a un volumen persistente o DB gestionada.
 
 ## Despliegue
 
+> Guía práctica paso a paso (Render, Vercel, Docker): [`docs/deployment.md`](deployment.md).
+
 - **Opción A (simple):** backend completo en Render/Railway/Fly.io
   (contenedor con uvicorn + volumen para `data/`). Frontend ya lo sirve el
   mismo backend.
-- **Opción B (Vercel):** frontend estático en Vercel + backend como función
-  serverless (Vercel soporta Python). Ojo: el filesystem de Vercel es
-  efímero → `data/` necesitaría Vercel KV/Postgres (el puerto `ProgressStore`
-  hace ese cambio indoloro).
+- **Opción B (Vercel):** frontend + backend como función serverless (ya
+  configurado: `vercel.json` + `api/index.py`). El filesystem es efímero →
+  define `KIWI_DATABASE_URL` con tu Supabase y la función es 100% stateless
+  con persistencia real.
 - **Opción C (todo Vercel):** reescribir servicios como API routes de Next.js
   (el diseño por capas lo permite, pero hoy no aporta nada).
 
@@ -157,6 +161,10 @@ migra a React.
 - `backend/tests/test_api.py` — flujos E2E con TestClient y datos en tmp:
   catálogo, **anti-fugas**, práctica, lección completa, examen perfecto/cero,
   reportes MD+JSON, dashboard, **aislamiento multiusuario**.
+- `backend/tests/test_sql_store.py` — ProgressStore SQL (driver SQLite):
+  roundtrip de progreso, intentos (orden/aislamiento/idempotencia), reportes,
+  esquema idempotente, fábrica JSON↔SQL por env, e integración completa
+  servicio+SQL (ejercicio + examen + reporte).
 - `tests/frontend_smoke.mjs` — jsdom contra la API real: render de las 5
   vistas, interacción real (click en opción → feedback), examen completo
   (intro → start → responder → entregar → resultados → revisión).

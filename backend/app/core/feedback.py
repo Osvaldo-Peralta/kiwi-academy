@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Optional
 
 from .models import Attempt, Exercise, QuestionResult
 
@@ -55,7 +55,7 @@ def compute_weak_tags(results: list[QuestionResult], threshold: float = 0.7) -> 
 def build_recommendations(
     weak_tags: list[dict[str, Any]],
     tag_to_lessons: dict[str, list[str]],
-    passed: bool | None,
+    passed: Optional[bool],
     percent: float,
 ) -> list[str]:
     recs: list[str] = []
@@ -80,7 +80,7 @@ def build_recommendations(
 def build_attempt_feedback(
     results: list[QuestionResult],
     percent: float,
-    passed: bool | None,
+    passed: Optional[bool],
     tag_to_lessons: dict[str, list[str]],
 ) -> tuple[str, list[dict[str, Any]], list[str]]:
     weak = compute_weak_tags(results)

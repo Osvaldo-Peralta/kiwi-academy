@@ -1,12 +1,14 @@
 """Dependencias compartidas de la API."""
 from __future__ import annotations
 
+from typing import Optional
+
 from fastapi import Header
 
 from ...config import settings
 from ...core.services import LearningService
 
-_service: LearningService | None = None
+_service: Optional[LearningService] = None
 
 
 def get_service() -> LearningService:
@@ -17,7 +19,7 @@ def get_service() -> LearningService:
     return _service
 
 
-def get_user_id(x_user_id: str | None = Header(default=None)) -> str:
+def get_user_id(x_user_id: Optional[str] = Header(default=None)) -> str:
     """Multi-usuario desde el día 1: el frontend manda X-User-Id.
 
     Hoy: un header simple (uso local, un estudiante).

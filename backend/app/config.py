@@ -3,15 +3,25 @@
 Todas las rutas se resuelven relativas a la raíz del proyecto para que el
 backend funcione igual en local, en CI y en un despliegue (Vercel/Render).
 Para producción, los valores pueden sobreescribirse con variables de
-entorno (SOCACADEMY_*), sin tocar código.
+entorno (KIWI_*), sin tocar código.
 """
 from __future__ import annotations
 
 import os
+import tempfile
 from pathlib import Path
 
 # backend/app/config.py -> raíz del proyecto = 2 niveles arriba
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+# Soporte opcional de .env (python-dotenv). Las variables de entorno reales
+# siempre tienen prioridad sobre el archivo.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(PROJECT_ROOT / ".env")
+except ImportError:  # dotenv no instalado -> sin .env, todo por variables de entorno
+    pass
 
 
 def _env_path(name: str, default: Path) -> Path:
@@ -19,26 +29,54 @@ def _env_path(name: str, default: Path) -> Path:
     return Path(raw).resolve() if raw else default
 
 
+def _writable_dir(path: Path, fallback_name: str) -> Path:
+    """Garantiza un directorio de datos escribible.
+
+    En serverless (Vercel/Lambda) el filesystem del despliegue es de solo
+    lectura: ahí caemos a /tmp (efímero — el progreso se reinicia en cada
+    arranque en frío; ver docs/deployment.md para persistencia real).
+    """
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / ".writable-probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        return path
+    except OSError:
+        fallback = Path(tempfile.gettempdir()) / fallback_name
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+
+
 class Settings:
-    app_name: str = "SOC Academy"
+    app_name: str = "Kiwi Academy"
     version: str = "0.1.0"
 
     # Contenido versionado (cursos, lecciones, exámenes) — solo lectura en runtime
-    CONTENT_DIR: Path = _env_path("SOCACADEMY_CONTENT_DIR", PROJECT_ROOT / "content")
+    CONTENT_DIR: Path = _env_path("KIWI_CONTENT_DIR", PROJECT_ROOT / "content")
 
-    # Datos mutables (progreso de usuarios, intentos, reportes)
-    DATA_DIR: Path = _env_path("SOCACADEMY_DATA_DIR", PROJECT_ROOT / "data")
+    # Datos mutables (progreso de usuarios, intentos, reportes).
+    # Si el destino no es escribible (serverless), cae a /tmp automáticamente.
+    DATA_DIR: Path = _writable_dir(
+        _env_path("KIWI_DATA_DIR", PROJECT_ROOT / "data"),
+        "kiwi-academy-data",
+    )
 
     # Frontend estático
-    FRONTEND_DIR: Path = _env_path("SOCACADEMY_FRONTEND_DIR", PROJECT_ROOT / "frontend")
+    FRONTEND_DIR: Path = _env_path("KIWI_FRONTEND_DIR", PROJECT_ROOT / "frontend")
 
     # Usuario por defecto cuando no llega cabecera X-User-Id (uso local)
-    DEFAULT_USER_ID: str = os.environ.get("SOCACADEMY_DEFAULT_USER", "default")
+    DEFAULT_USER_ID: str = os.environ.get("KIWI_DEFAULT_USER", "default")
+
+    # Persistencia SQL opcional (Supabase/Postgres o SQLite). Vacío = archivos JSON.
+    #   postgresql://user:pass@host:port/db   (Supabase: Settings -> Database -> URI)
+    #   sqlite:///ruta/kiwi.db
+    DATABASE_URL: str = os.environ.get("KIWI_DATABASE_URL", "").strip()
 
     # CORS: en local el frontend lo sirve el propio backend (mismo origen),
     # pero dejamos abierto para desarrollo; en producción se restringe.
     CORS_ORIGINS: list[str] = os.environ.get(
-        "SOCACADEMY_CORS_ORIGINS", "*"
+        "KIWI_CORS_ORIGINS", "*"
     ).split(",")
 
     @property

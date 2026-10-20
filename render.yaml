@@ -1,0 +1,23 @@
+# Render Blueprint — despliegue con un clic (New -> Blueprint -> elegir repo).
+#
+# Nota: el disco persistente (mountPath /app/data) requiere instance de pago
+# (Starter ~$7/mes). En plan free la app funciona igual, pero el progreso se
+# reinicia en cada redeploy/reinicio. Para free + persistencia real, ver
+# docs/deployment.md (ruta Postgres).
+
+services:
+  - type: web
+    name: kiwi-academy
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /healthz
+    plan: free
+    envVars:
+      - key: KIWI_DATA_DIR
+        value: /app/data
+      - key: KIWI_CORS_ORIGINS
+        value: "*"
+    disk:
+      name: kiwi-data
+      mountPath: /app/data
+      sizeGB: 1

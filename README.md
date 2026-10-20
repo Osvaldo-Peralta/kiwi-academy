@@ -1,8 +1,9 @@
-# 🛡️ SOC Academy
+# 🥝 Kiwi Academy
 
-**Laboratorio interactivo de estudio para Analista SOC N1** — y plataforma de
-aprendizaje escalable por diseño (hoy un curso y un estudiante; mañana una
-academia con muchos cursos y miles de estudiantes).
+**Centro académico con educación de calidad mundial** 🥝 — plataforma de
+aprendizaje interactivo escalable por diseño. Su primer curso: **Analista SOC
+N1** (hoy un curso y un estudiante; mañana una academia con muchos cursos y
+miles de estudiantes).
 
 Construido a partir de tu roadmap personal: **teoría → ejemplos reales →
 ejercicios con feedback inmediato → exámenes cronometrados → reportes
@@ -15,7 +16,7 @@ exportables para feedback profundo con IA/mentor.**
 Requisitos: **Python 3.10+** (nada más; el frontend no requiere build).
 
 ```bash
-cd soc-academy
+cd kiwi-academy
 pip install -r requirements.txt
 python run.py
 ```
@@ -24,17 +25,42 @@ Abre **http://localhost:8000** — listo. 🎉
 
 - Documentación interactiva de la API: http://localhost:8000/api/docs
 - Tu progreso se guarda en `data/users/default/` (archivos JSON, inspeccionables)
+- `run.py` hace un **preflight con diagnósticos**: si algo falla (Python viejo,
+  dependencias, puerto ocupado) te dice exactamente qué y cómo arreglarlo
+
+### Si algo falla en local
+
+| Síntoma | Causa típica | Solución |
+|---------|--------------|----------|
+| `ModuleNotFoundError: fastapi` (o yaml/uvicorn) | Dependencias no instaladas (o venv sin activar) | `pip install -r requirements.txt` |
+| `TypeError: unsupported operand type(s) for \|` al arrancar | Python 3.8 o menor | Instala Python 3.9+ (recomendado 3.11+) |
+| `address already in use` | Otra instancia corriendo en el puerto 8000 | `KIWI_PORT=8001 python run.py` (Windows: `set KIWI_PORT=8001`) |
+| La página carga pero dice "No se pudo contactar la API" | Abriste `index.html` directo (file://) en vez de pasar por el server | Entra siempre por `http://localhost:8000` |
+| `Error: contenido inválido` al cargar un curso | YAML de contenido mal editado | El mensaje incluye archivo y línea; revisa tu última edición |
+| Puerto ocupado en Windows sin saber por qué | — | `netstat -ano \| findstr :8000` → `taskkill /PID <pid> /F` |
 
 ### Tests
 
 ```bash
-# Backend (motor de evaluación + API): 26 tests
+# Backend (motor de evaluación + API + store SQL): 35 tests
 pip install -r requirements-dev.txt
 python -m pytest backend/tests/ -q
 
 # Frontend (requiere el server corriendo + npm install)
 npm install
 node tests/frontend_smoke.mjs
+```
+
+### Despliegue
+
+Listo para **Render** (`render.yaml` + Dockerfile), **Vercel** (`vercel.json` +
+`api/index.py`) o **cualquier Docker host**. Guía paso a paso con comparativa
+de persistencia de datos en [`docs/deployment.md`](docs/deployment.md).
+
+```bash
+# Docker local en 2 comandos:
+docker build -t kiwi-academy .
+docker run -d -p 8000:8000 -v kiwi-data:/app/data kiwi-academy
 ```
 
 ---
@@ -96,7 +122,7 @@ feedback ya redactado.
 |---|---|
 | Más cursos (SOC N2, etc.) | Un curso = una carpeta YAML en `content/courses/`. La API los descubre sola |
 | Más tipos de ejercicio | Escribir 1 función grader + registrarla en `GRADERS` (10 líneas) |
-| Base de datos real | Implementar `ContentStore`/`ProgressStore` contra Postgres/SQLite; cero cambios en servicios y API |
+| Base de datos real | ✅ **Ya disponible**: `KIWI_DATABASE_URL=postgresql://...` (Supabase) o `sqlite:///...` — mismo contrato `ProgressStore`, cero cambios en servicios/API |
 | Multiusuario / 1000+ estudiantes | `X-User-Id` ya aísla datos por usuario; se sustituye por auth JWT en `deps.py` |
 | Frontend React/móvil | La API REST v1 es el contrato; el frontend actual es reemplazable sin tocar backend |
 | Despliegue | Backend: Render/Railway/Fly (uvicorn) o Vercel (serverless). Frontend: Vercel/Netlify estático. `DATA_DIR`/`CONTENT_DIR` via env vars |
@@ -125,18 +151,21 @@ cambiar su `status: published`.
 ## 📁 Estructura del proyecto
 
 ```
-soc-academy/
+kiwi-academy/
 ├── run.py                     # arranque local (uvicorn --reload)
 ├── requirements.txt           # fastapi, uvicorn, pydantic, pyyaml
 ├── package.json               # solo devDeps de tests frontend (jsdom)
+├── Dockerfile                 # imagen de producción (Render/Railway/Fly/VPS)
+├── render.yaml                # Blueprint de Render (un clic)
+├── vercel.json + api/         # despliegue serverless en Vercel
 ├── backend/
 │   ├── app/
 │   │   ├── main.py            # FastAPI app factory + static mount
-│   │   ├── config.py          # rutas/env (SOCACADEMY_*)
+│   │   ├── config.py          # rutas/env (KIWI_*) + fallback /tmp serverless
 │   │   ├── api/v1/            # cursos, lecciones, exámenes, progreso
 │   │   ├── core/              # models, services, evaluation, feedback, errors
 │   │   └── storage/           # base (puertos) + json_store (adaptador)
-│   └── tests/                 # 26 tests: evaluación + API + anti-fugas
+│   └── tests/                 # 35 tests: evaluación + API + anti-fugas + SQL store
 ├── content/courses/soc-n1/    # CONTENIDO (YAML versionado)
 │   ├── course.yaml
 │   ├── modules/<id>/{module.yaml, lessons/<id>.yaml}
@@ -145,7 +174,7 @@ soc-academy/
 ├── frontend/                  # SPA sin build (index.html, css/, js/)
 ├── tests/frontend_smoke.mjs   # smoke test jsdom de todas las vistas
 ├── tools/                     # generadores de contenido
-└── docs/                      # arquitectura + guía de contenido
+└── docs/                      # arquitectura + contenido + despliegue
 ```
 
 ---

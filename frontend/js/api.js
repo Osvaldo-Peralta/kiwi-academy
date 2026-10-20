@@ -4,7 +4,7 @@
 const BASE = "/api/v1";
 
 // Usuario local. Cuando haya multiusuario real, esto sale de un login.
-export const USER_ID = localStorage.getItem("socacademy.userId") || "default";
+export const USER_ID = localStorage.getItem("kiwi.userId") || "default";
 
 async function request(path, options = {}) {
   const res = await fetch(`${BASE}${path}`, {
