@@ -17,7 +17,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
-from .models import Exercise
+from .errors import ValidationError
+from .models import Exam, Exercise
 
 
 @dataclass
@@ -178,29 +179,41 @@ def grade_matching(ex: Exercise, submitted: Any) -> GradeOutcome:
 
 
 def grade_free_text(ex: Exercise, submitted: Any) -> GradeOutcome:
-    """No se auto-califica de forma definitiva: calcula cobertura de keywords
-    como orientación y lo marca para revisión (humana o IA vía reporte)."""
+    """Iteración 2: la evaluación automática NO puntúa respuestas libres.
+
+    Una coincidencia de palabras clave no es prueba de comprensión: la
+    cobertura se reporta como señal ORIENTATIVA y la puntuación definitiva la
+    asigna un revisor humano. Sin respuesta => nada que revisar (0 pts auto).
+    """
     ans = ex.answer or {}
     keywords = [str(k) for k in ans.get("keywords", [])]
-    min_kw = int(ans.get("min_keywords", max(1, len(keywords) // 2)))
     text = _normalize(submitted)
     if not text:
         return GradeOutcome(
-            None, 0.0, "No enviaste respuesta.", needs_review=False
+            None, 0.0,
+            "Sin respuesta: no hay nada que revisar; puntúa 0 en la parte automática.",
+            needs_review=False,
+            detail={"review_status": "not_answered"},
         )
     covered = [k for k in keywords if _normalize(k) in text]
-    ratio_hint = len(covered) / len(keywords) if keywords else 0.0
-    pending = len(covered) >= min_kw
+    missing = [k for k in keywords if k not in covered]
+    coverage = len(covered) / len(keywords) if keywords else 0.0
     fb = (
-        f"Respuesta registrada ({len(covered)}/{len(keywords)} conceptos clave detectados). "
-        + ("Queda pendiente de revisión detallada — está incluida en tu reporte exportable para feedback con IA."
-           if pending else
-           "Cobertura baja de conceptos clave; igualmente se incluye en tu reporte para feedback.")
+        f"Respuesta registrada para revisión humana. "
+        f"Cobertura ORIENTATIVA de conceptos clave: {len(covered)}/{len(keywords)} "
+        f"(la coincidencia de palabras NO es prueba de comprensión: no suma "
+        f"puntos automáticos; un revisor autorizado asignará la puntuación "
+        f"definitiva). Incluida en tu reporte exportable."
     )
     return GradeOutcome(
-        None, ratio_hint, fb,
+        None, 0.0, fb,
         needs_review=True,
-        detail={"keywords_covered": covered, "keywords_missing": [k for k in keywords if k not in covered]},
+        detail={
+            "review_status": "pending",
+            "keyword_coverage": round(coverage, 3),
+            "keywords_covered": covered,
+            "keywords_missing": missing,
+        },
     )
 
 
@@ -221,3 +234,119 @@ def grade_exercise(ex: Exercise, submitted: Any) -> GradeOutcome:
     outcome = grader(ex, submitted)
     # Añade la explicación pedagógica del contenido (si existe)
     return outcome
+
+
+# ---------------------------------------------------------------------------
+# Iteración 2 (QA-04): validación estructural estricta de respuestas de examen
+# ---------------------------------------------------------------------------
+
+FREE_TEXT_MAX_CHARS = 20000
+
+
+def _answer_type_error(qid: str, expected: str, got: Any) -> dict[str, Any]:
+    return {
+        "exercise_id": qid,
+        "problem": "answer_type",
+        "expected": expected,
+        "got_type": type(got).__name__,
+    }
+
+
+def validate_exam_responses(exam, responses: list[dict[str, Any]]) -> dict[str, Any]:
+    """Valida la estructura completa del envío de un examen.
+
+    Reglas (rechazo controlado 422 con detalle preciso, nunca silencio):
+    - Deben estar TODAS las preguntas del examen, exactamente una vez cada
+      una y EN EL ORDEN del examen (ids y orden validados; duplicados y
+      desconocidos se listan en el error).
+    - `answer` puede ser null (sin responder) — puntúa 0, no es malformado.
+    - Por tipo, la respuesta debe tener la estructura exacta del contrato:
+      * multiple_choice: str ∈ ids de opciones
+      * multiple_select: list[str] ⊆ ids, sin duplicados
+      * fill_blank: str (1 blank) o list[str] con longitud == nº de blanks
+      * ordering: list[str] ⊆ ids de items, sin duplicados
+      * matching: dict {left_id: right_id} con ids válidos y derechos únicos
+      * free_text: str de longitud ≤ FREE_TEXT_MAX_CHARS
+
+    Devuelve {exercise_id: answer} normalizado.
+    Lanza ValidationError (422) con details["problems"] exhaustivo.
+    """
+    problems: list[dict[str, Any]] = []
+    q_ids = [q.id for q in exam.questions]
+    got_ids = [str(r.get("exercise_id", "")) for r in responses]
+
+    # 1) cobertura exacta: mismos ids, sin duplicados ni desconocidos
+    unknown = [g for g in got_ids if g not in set(q_ids)]
+    seen: set[str] = set()
+    duplicates = sorted({g for g in got_ids if g in seen or seen.add(g)})  # type: ignore
+    missing = [q for q in q_ids if q not in set(got_ids)]
+    if unknown:
+        problems.append({"problem": "unknown_ids", "ids": sorted(set(unknown))})
+    if duplicates:
+        problems.append({"problem": "duplicate_ids", "ids": duplicates})
+    if missing:
+        problems.append({"problem": "missing_ids", "ids": missing})
+    # 2) orden exacto (solo tiene sentido si la cobertura es correcta)
+    if not (unknown or duplicates or missing) and got_ids != q_ids:
+        problems.append({"problem": "wrong_order", "expected": q_ids, "got": got_ids})
+
+    if problems:
+        raise ValidationError(
+            "Envío de examen malformado: identificadores incompletos, "
+            "duplicados, desconocidos o fuera de orden.",
+            problems=problems,
+        )
+
+    # 3) validación por tipo de cada respuesta
+    by_id = {str(r.get("exercise_id")): r.get("answer") for r in responses}
+    for q in exam.questions:
+        a = by_id.get(q.id)
+        if a is None:
+            continue  # sin responder: permitido
+        if q.type == "multiple_choice":
+            valid = {o.id for o in (q.options or [])}
+            if not isinstance(a, str) or a not in valid:
+                problems.append(_answer_type_error(q.id, f"str ∈ {sorted(valid)}", a))
+        elif q.type == "multiple_select":
+            valid = {o.id for o in (q.options or [])}
+            if not isinstance(a, list) or any(not isinstance(x, str) or x not in valid for x in a) \
+                    or len(set(a)) != len(a):
+                problems.append(_answer_type_error(q.id, f"list[str] ⊆ {sorted(valid)} sin duplicados", a))
+        elif q.type == "fill_blank":
+            n_blanks = len((q.answer or {}).get("blanks") or [None])
+            if n_blanks == 1:
+                if not isinstance(a, (str, list)) or (isinstance(a, list) and (len(a) != 1 or not isinstance(a[0], str))):
+                    problems.append(_answer_type_error(q.id, "str (o list[str] de 1)", a))
+            else:
+                if not isinstance(a, list) or len(a) != n_blanks or any(not isinstance(x, str) for x in a):
+                    problems.append(_answer_type_error(q.id, f"list[str] de longitud {n_blanks}", a))
+        elif q.type == "ordering":
+            valid = {i.id for i in (q.items or [])}
+            if not isinstance(a, list) or any(not isinstance(x, str) or x not in valid for x in a) \
+                    or len(set(a)) != len(a):
+                problems.append(_answer_type_error(q.id, f"list[str] ⊆ {sorted(valid)} sin duplicados", a))
+        elif q.type == "matching":
+            lefts = {p.left_id for p in (q.pairs or [])}
+            rights = {p.right_id for p in (q.pairs or [])}
+            # dict vacío = "sin responder" (el widget no tocado envía {}): permitido
+            ok = isinstance(a, dict) and all(
+                isinstance(k, str) and k in lefts and isinstance(v, str) and v in rights
+                for k, v in a.items()
+            )
+            if ok and len(set(a.values())) != len(a):
+                ok = False  # dos izquierdos al mismo derecho: malformado
+            if not ok:
+                problems.append(_answer_type_error(q.id, "dict {left_id: right_id} con ids válidos y únicos", a))
+        elif q.type == "free_text":
+            if not isinstance(a, str) or len(a) > FREE_TEXT_MAX_CHARS:
+                problems.append(_answer_type_error(
+                    q.id, f"str de ≤ {FREE_TEXT_MAX_CHARS} caracteres", a if not isinstance(a, str) else f"str({len(a)})"))
+        else:
+            problems.append(_answer_type_error(q.id, "tipo de ejercicio desconocido", a))
+
+    if problems:
+        raise ValidationError(
+            "Respuestas con estructura inválida para su tipo de ejercicio.",
+            problems=problems,
+        )
+    return by_id

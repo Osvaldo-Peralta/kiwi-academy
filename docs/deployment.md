@@ -118,6 +118,8 @@ docker run -d --name kiwi -p 8000:8000 -v kiwi-data:/app/data kiwi-academy
 | `SUPABASE_ANON_KEY` | *(vacío)* | Clave pública del navegador (se sirve vía `/api/v1/config`) |
 | `KIWI_JWT_MODE` | `auto` | `auto` (secret si hay secreto, si no jwks) / `secret` / `jwks` |
 | `KIWI_DEV_JWT_SECRET` | *(efímero)* | Secreto estable del emisor dev (modo `local`) |
+| `KIWI_REVIEWER_USERS` | *(vacío)* | CSV de `sub` autorizados a revisar respuestas libres; vacío = exámenes pendientes sin veredicto |
+| `KIWI_EXAM_GRACE_SECONDS` | `30` | Margen de red sobre el límite del examen (lo cumple el servidor) |
 | `KIWI_DATABASE_URL` | *(vacío = JSON files)* | `postgresql://...` (Supabase) o `sqlite:///ruta.db` |
 | `KIWI_DATA_DIR` | `<repo>/data` (ó `/tmp/kiwi-academy-data` si no hay permisos) | Dónde vive el progreso (modo archivos) |
 | `KIWI_CONTENT_DIR` | `<repo>/content` | Cursos/lecciones/exámenes |

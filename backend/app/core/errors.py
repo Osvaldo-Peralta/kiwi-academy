@@ -52,6 +52,13 @@ class AuthNotConfiguredError(AppError):
     code = "auth_not_configured"
 
 
+class PermissionDeniedError(AppError):
+    """Identidad válida pero sin permiso para el recurso/acción (p. ej. revisión
+    humana sin estar en la lista de revisores). 403."""
+    status_code = 403
+    code = "permission_denied"
+
+
 def register_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(AppError)
     async def _app_error_handler(request: Request, exc: AppError):  # noqa: ARG001

@@ -18,13 +18,15 @@ from ..config import settings
 from ..core.errors import ContentError
 from .base import ContentStore, ProgressStore
 
-_LOCKS: dict[str, threading.Lock] = {}
+_LOCKS: dict[str, threading.RLock] = {}
 _LOCKS_GUARD = threading.Lock()
 
 
-def _lock_for(path: str) -> threading.Lock:
+def _lock_for(path: str) -> threading.RLock:
+    # RLock (reentrante): permite componer operaciones CAS que reutilizan
+    # _write_json bajo el mismo lock de ruta.
     with _LOCKS_GUARD:
-        return _LOCKS.setdefault(path, threading.Lock())
+        return _LOCKS.setdefault(path, threading.RLock())
 
 
 CONTENT_EXTENSIONS = (".yaml", ".yml", ".json")
@@ -171,9 +173,45 @@ class JsonProgressStore(ProgressStore):
     def save_attempt(self, user_id: str, attempt: dict[str, Any]) -> None:
         _write_json(self._attempts_dir(user_id) / f"{attempt['id']}.json", attempt)
 
+    def update_attempt(self, user_id: str, attempt: dict[str, Any]) -> bool:
+        path = self._attempts_dir(user_id) / f"{attempt['id']}.json"
+        if not path.exists():
+            return False  # guarda de propiedad: solo actualiza lo existente
+        _write_json(path, attempt)
+        return True
+
+    def update_attempt_if_status(
+        self, user_id: str, attempt_id: str,
+        expected_status: str, attempt: dict[str, Any],
+    ) -> bool:
+        """CAS atómico en el proceso: lectura + comprobación + escritura bajo
+        el mismo lock de ruta (RLock). Exactamente un hilo ganador."""
+        safe = "".join(c for c in attempt_id if c.isalnum() or c in "-_")
+        path = self._attempts_dir(user_id) / f"{safe}.json"
+        with _lock_for(str(path)):
+            current = _read_json(path)
+            if not current:
+                return False
+            if (current.get("score") or {}).get("status") != expected_status:
+                return False
+            _write_json(path, attempt)
+            return True
+
     def get_attempt(self, user_id: str, attempt_id: str) -> Optional[dict[str, Any]]:
         safe = "".join(c for c in attempt_id if c.isalnum() or c in "-_")
         return _read_json(self._attempts_dir(user_id) / f"{safe}.json")
+
+    def find_attempt_any_user(self, attempt_id: str) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+        safe = "".join(c for c in attempt_id if c.isalnum() or c in "-_")
+        if not self.root.exists():
+            return None, None
+        for user_dir in sorted(self.root.iterdir()):
+            if not user_dir.is_dir():
+                continue
+            data = _read_json(user_dir / "attempts" / f"{safe}.json")
+            if data:
+                return user_dir.name, data
+        return None, None
 
     def list_attempts(self, user_id: str, limit: int = 50) -> list[dict[str, Any]]:
         files = sorted(self._attempts_dir(user_id).glob("*.json"), reverse=True)[:limit]

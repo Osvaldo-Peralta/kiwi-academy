@@ -150,12 +150,107 @@ class SqlProgressStore(ProgressStore):
             sql = "INSERT OR IGNORE INTO kiwi_attempts (id, user_id, submitted_at, scope_type, data) VALUES (?, ?, ?, ?, ?)"
         self._execute([(sql, (attempt["id"], user_id, submitted, scope_type, data))])
 
+    def update_attempt(self, user_id: str, attempt: dict[str, Any]) -> bool:
+        # Guarda de propiedad en el WHERE: solo actualiza si el intento existe
+        # Y pertenece a user_id. Nunca reasigna propiedad ni crea filas.
+        data = json.dumps(attempt, ensure_ascii=False)
+        submitted = str(attempt.get("submitted_at", ""))
+        sql = "UPDATE kiwi_attempts SET data = ?, submitted_at = ? WHERE id = ? AND user_id = ?"
+        conn = self._connect()
+        try:
+            cur = conn.cursor()
+            cur.execute(self._sql(sql), (data, submitted, attempt["id"], user_id))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+    def update_attempt_if_status(
+        self, user_id: str, attempt_id: str,
+        expected_status: str, attempt: dict[str, Any],
+    ) -> bool:
+        """CAS atómico: la transición de estado ocurre dentro de UNA
+        transacción con bloqueo (Postgres: SELECT … FOR UPDATE; SQLite:
+        BEGIN IMMEDIATE). Revisiones concurrentes se serializan: la primera
+        gana y la segunda observa el estado nuevo y devuelve False."""
+        data = json.dumps(attempt, ensure_ascii=False)
+        submitted = str(attempt.get("submitted_at", ""))
+
+        def _status_of(raw: str) -> Optional[str]:
+            try:
+                return (json.loads(raw).get("score") or {}).get("status")
+            except (ValueError, AttributeError):
+                return None
+
+        if self.is_postgres:
+            conn = self._connect()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    self._sql("SELECT data FROM kiwi_attempts WHERE id = ? AND user_id = ? FOR UPDATE"),
+                    (attempt_id, user_id),
+                )
+                row = cur.fetchone()
+                if not row or _status_of(row[0]) != expected_status:
+                    conn.rollback()
+                    return False
+                cur.execute(
+                    self._sql("UPDATE kiwi_attempts SET data = ?, submitted_at = ? WHERE id = ? AND user_id = ?"),
+                    (data, submitted, attempt_id, user_id),
+                )
+                conn.commit()
+                return True
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise
+            finally:
+                conn.close()
+
+        # SQLite: autocommit manual para controlar BEGIN IMMEDIATE
+        conn = sqlite3.connect(self.sqlite_path, timeout=15, isolation_level=None)
+        cur = conn.cursor()
+        try:
+            cur.execute("BEGIN IMMEDIATE")
+            cur.execute(
+                "SELECT data FROM kiwi_attempts WHERE id = ? AND user_id = ?",
+                (attempt_id, user_id),
+            )
+            row = cur.fetchone()
+            if not row or _status_of(row[0]) != expected_status:
+                cur.execute("ROLLBACK")
+                return False
+            cur.execute(
+                "UPDATE kiwi_attempts SET data = ?, submitted_at = ? WHERE id = ? AND user_id = ?",
+                (data, submitted, attempt_id, user_id),
+            )
+            cur.execute("COMMIT")
+            return True
+        except Exception:
+            try:
+                cur.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
     def get_attempt(self, user_id: str, attempt_id: str) -> Optional[dict[str, Any]]:
         rows = self._execute([
             ("SELECT data FROM kiwi_attempts WHERE id = ? AND user_id = ?",
              (attempt_id, user_id)),
         ])[0]
         return json.loads(rows[0][0]) if rows else None
+
+    def find_attempt_any_user(self, attempt_id: str) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+        rows = self._execute([
+            ("SELECT user_id, data FROM kiwi_attempts WHERE id = ?", (attempt_id,)),
+        ])[0]
+        if not rows:
+            return None, None
+        return rows[0][0], json.loads(rows[0][1])
 
     def list_attempts(self, user_id: str, limit: int = 50) -> list[dict[str, Any]]:
         rows = self._execute([

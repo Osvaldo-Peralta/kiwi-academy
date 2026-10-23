@@ -51,11 +51,11 @@ emitida por Supabase Auth, verificada en el backend con HS256 o JWKS).
 ### Tests
 
 ```bash
-# Backend (evaluación + API + auth/JWT + store SQL): 67 tests
+# Backend (evaluación + API + auth/JWT + integridad de examen + SQL): 95 tests
 pip install -r requirements-dev.txt
 python -m pytest backend/tests/ -q
 
-# Frontend (28 verificaciones; requiere el server en modo test + npm install)
+# Frontend (55 verificaciones; requiere el server en modo test + npm install)
 npm install
 KIWI_AUTH_MODE=test uvicorn backend.app.main:app --host 127.0.0.1 --port 8000 &
 node tests/frontend_smoke.mjs
@@ -90,8 +90,16 @@ docker run -d -p 8000:8000 -v kiwi-data:/app/data kiwi-academy
 
 **Tipos de ejercicio soportados:** opción única, selección múltiple (crédito
 parcial), completar espacios (multi-blank + regex), ordenar secuencias
-(drag & drop), asociar pares (shuffle anti-trampa) y respuesta libre
-(revisión pendiente → se exporta en el reporte para feedback humano/IA).
+(drag & drop), asociar pares (shuffle anti-trampa) y respuesta libre.
+
+**Exámenes con integridad de servidor (Iteración 2):** el servidor emite una
+sesión por intento y hace cumplir el límite de tiempo con su propio reloj
+(el temporizador del cliente es informativo); los envíos se validan de forma
+estricta (ids, duplicados, orden y estructura por tipo). Las respuestas
+libres **no puntúan automáticamente** (la cobertura de palabras clave es
+orientativa): el examen queda **PENDIENTE DE REVISIÓN HUMANA** con resultado
+provisional hasta que un revisor autorizado (`KIWI_REVIEWER_USERS`) asigna
+los puntos definitivos vía `POST /api/v1/reviews/attempts/{id}`.
 
 **El loop de feedback con IA:** al terminar un examen pulsa *"Copiar reporte
 (Markdown)"* y pégalo en tu chat con Qwen (o tu mentor). El reporte incluye
@@ -175,7 +183,7 @@ kiwi-academy/
 │   │   ├── api/v1/            # auth/config, cursos, lecciones, exámenes, progreso
 │   │   ├── core/              # auth (JWT), models, services, evaluation, feedback, errors
 │   │   └── storage/           # base (puertos) + json_store + sql_store + factory
-│   └── tests/                 # 67 tests: evaluación + API + auth/JWT + anti-fugas + SQL
+│   └── tests/                 # 95 tests: evaluación + API + auth/JWT + integridad examen + SQL
 ├── content/courses/soc-n1/    # CONTENIDO (YAML versionado)
 │   ├── course.yaml
 │   ├── modules/<id>/{module.yaml, lessons/<id>.yaml}

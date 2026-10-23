@@ -73,6 +73,27 @@ def test_reports_upsert(store):
     store.save_report("bob", "att_1", "report.md", "# v2")  # upsert sin error
 
 
+# ------------------------------------------- Iteración 2: update/find cross-user
+def test_update_attempt_guarda_propiedad(store):
+    store.save_attempt("bob", _attempt("att_u1", "2026-10-01T10:00:00Z"))
+    att = store.get_attempt("bob", "att_u1")
+    att["score"]["percent"] = 99
+    assert store.update_attempt("bob", att) is True
+    assert store.get_attempt("bob", "att_u1")["score"]["percent"] == 99
+    # otro usuario NO puede actualizarlo (guarda de propiedad en el WHERE)
+    assert store.update_attempt("mallory", att) is False
+    # inexistente -> False (nunca crea)
+    assert store.update_attempt("bob", {"id": "att_ghost", "submitted_at": "x"}) is False
+    assert store.get_attempt("bob", "att_ghost") is None
+
+
+def test_find_attempt_any_user(store):
+    store.save_attempt("bob", _attempt("att_f1", "2026-10-01T10:00:00Z"))
+    owner, data = store.find_attempt_any_user("att_f1")
+    assert owner == "bob" and data["id"] == "att_f1"
+    assert store.find_attempt_any_user("att_inexistente") == (None, None)
+
+
 # ------------------------------------------------------------------ esquema
 def test_schema_idempotent(tmp_path):
     url = f"sqlite:///{tmp_path / 'x.db'}"
@@ -130,9 +151,14 @@ def test_service_integration_with_sql_store(store):
             ans = a
         responses.append({"exercise_id": q.id, "answer": ans})
 
-    out = service.submit_exam("dana", "soc-n1", "fase-1-examen", responses,
-                              started_at=None, duration_seconds=600)
-    assert out["score"]["passed"] is True
+    sess = service.start_exam_session("dana", "soc-n1", "fase-1-examen")
+    out = service.submit_exam("dana", "soc-n1", "fase-1-examen",
+                              sess["session_id"], responses)
+    # Iteración 2: respuestas perfectas + free_text contestada -> PENDIENTE de
+    # revisión humana (nunca aprobado automáticamente)
+    assert out["score"]["status"] == "pending_review"
+    assert out["score"]["passed"] is None
+    assert out["score"]["provisional_percent"] == 100.0
 
     # persistido en SQL y recuperable
     attempts = store.list_attempts("dana")
@@ -141,7 +167,9 @@ def test_service_integration_with_sql_store(store):
     assert "Reporte de evaluación" in report["report"]
 
     # y el JSON sigue siendo idéntico en estructura (contrato del store)
-    assert json.loads(json.dumps(exam_att))["score"]["passed"] is True
+    # Iteración 2: el examen perfecto con respuesta libre NO se aprueba solo
+    assert json.loads(json.dumps(exam_att))["score"]["passed"] is None
+    assert json.loads(json.dumps(exam_att))["score"]["status"] == "pending_review"
 
 
 def test_env_switch_via_variable(monkeypatch, tmp_path):

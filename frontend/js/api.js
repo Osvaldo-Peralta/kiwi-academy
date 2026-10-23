@@ -60,6 +60,8 @@ export const api = {
 
   // exámenes
   getExam: (cid, examId) => request(`/courses/${cid}/exams/${examId}`),
+  startExamSession: (cid, examId) =>
+    request(`/courses/${cid}/exams/${examId}/sessions`, { method: "POST" }),
   submitExam: (cid, examId, payload) =>
     request(`/courses/${cid}/exams/${examId}/attempts`, { method: "POST", body: JSON.stringify(payload) }),
   getReport: (cid, attemptId, fmt = "markdown") =>

@@ -52,7 +52,40 @@ class ProgressStore(ABC):
     def save_attempt(self, user_id: str, attempt: dict[str, Any]) -> None: ...
 
     @abstractmethod
+    def update_attempt(self, user_id: str, attempt: dict[str, Any]) -> bool:
+        """Actualiza un intento EXISTENTE propiedad de user_id (p. ej. tras
+        revisión humana). Devuelve False si no existe el intento para ese
+        usuario (guarda de propiedad: nunca crea ni reasigna)."""
+        ...
+
+    @abstractmethod
+    def update_attempt_if_status(
+        self, user_id: str, attempt_id: str,
+        expected_status: str, attempt: dict[str, Any],
+    ) -> bool:
+        """Compare-And-Swap atómico: actualiza el intento SOLO si su
+        score.status actual == expected_status. Devuelve True si esta llamada
+        ganó la transición; False si el intento no existe, no pertenece al
+        usuario, u otra operación ya cambió el estado (condición de carrera
+        resuelta: exactamente un ganador).
+
+        Garantías por implementación:
+        - JSON: lock reentrante por ruta (serializa lectores/escritores del
+          proceso; el store JSON es single-proceso por diseño — ver docs).
+        - SQL: transacción con bloqueo de fila (Postgres FOR UPDATE) o
+          BEGIN IMMEDIATE (SQLite), commit único.
+        """
+        ...
+
+    @abstractmethod
     def get_attempt(self, user_id: str, attempt_id: str) -> Optional[dict[str, Any]]: ...
+
+    @abstractmethod
+    def find_attempt_any_user(self, attempt_id: str) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+        """Busca un intento por id sin filtro de usuario (uso exclusivo del
+        flujo de revisión humana autorizado). Devuelve (user_id, attempt) o
+        (None, None)."""
+        ...
 
     @abstractmethod
     def list_attempts(self, user_id: str, limit: int = 50) -> list[dict[str, Any]]: ...

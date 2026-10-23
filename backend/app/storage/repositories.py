@@ -126,11 +126,24 @@ class ProgressRepository:
     def save_attempt(self, user_id: str, attempt: dict[str, Any]) -> None:
         self.store.save_attempt(user_id, attempt)
 
+    def update_attempt(self, user_id: str, attempt: dict[str, Any]) -> bool:
+        return self.store.update_attempt(user_id, attempt)
+
+    def update_attempt_if_status(
+        self, user_id: str, attempt_id: str,
+        expected_status: str, attempt: dict[str, Any],
+    ) -> bool:
+        return self.store.update_attempt_if_status(
+            user_id, attempt_id, expected_status, attempt)
+
     def get_attempt(self, user_id: str, attempt_id: str) -> dict[str, Any]:
         data = self.store.get_attempt(user_id, attempt_id)
         if not data:
             raise NotFoundError(f"Intento no encontrado: {attempt_id}")
         return data
+
+    def find_attempt_any_user(self, attempt_id: str) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+        return self.store.find_attempt_any_user(attempt_id)
 
     def list_attempts(self, user_id: str, limit: int = 50) -> list[dict[str, Any]]:
         return self.store.list_attempts(user_id, limit=limit)

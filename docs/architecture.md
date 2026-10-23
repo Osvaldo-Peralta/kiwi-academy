@@ -73,16 +73,21 @@ Los graders devuelven `ratio` 0.0–1.0, no solo bool: selección múltiple
 (aciertos − fallos), multi-blank (por espacio), ordenar (por posición),
 matching (por par). Esto da feedback más fino y notas más justas en exámenes.
 
-### Free text y el loop con IA
+### Free text y el loop con IA (Iteración 2: revisión humana formalizada)
 
-Las respuestas libres no se auto-califican de forma definitiva: el motor
-calcula cobertura de *keywords* (orientativo) y marca `needs_review=True`.
-El reporte Markdown exportable incluye la respuesta, la respuesta modelo, los
-conceptos cubiertos/faltantes y un prompt de revisión ya redactado — diseñado
-para pegarse en un chat con IA o enviarse a un mentor humano. Las free text
-respondidas cuentan para *completar* la lección (están "respondidas"), pero
-no suman "dominio" hasta que una revisión futura (manual o IA integrada) lo
-decida.
+Las respuestas libres **no puntúan automáticamente**: la cobertura de
+keywords se reporta como señal ORIENTATIVA (una coincidencia de palabras no
+es prueba de comprensión) y el examen queda en estado `pending_review` con
+resultado provisional sobre la parte automática. Un revisor humano autorizado
+(`KIWI_REVIEWER_USERS`, allowlist de `sub` resuelta contra el JWT verificado)
+consulta `GET /api/v1/reviews/attempts/{id}` (respuesta modelo + cobertura +
+respuesta del estudiante) y finaliza con `POST /api/v1/reviews/attempts/{id}`
+(puntos por pregunta + feedback), momento en el que se calcula el veredicto
+definitivo y se regenera el reporte. El reporte Markdown exportable sigue
+incluyendo la respuesta, la respuesta modelo, los conceptos cubiertos/faltantes
+y un prompt de revisión ya redactado — diseñado para pegarse en un chat con
+IA o enviarse a un mentor humano, que puede sugerir la puntuación que luego
+el revisor autorizado registra en la plataforma.
 
 ## Almacenamiento hoy → mañana
 

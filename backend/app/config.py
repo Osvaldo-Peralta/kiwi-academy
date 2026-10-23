@@ -85,6 +85,17 @@ class Settings:
     # Desarrollo local (modo local): secreto del emisor dev; si falta, efímero
     DEV_JWT_SECRET: str = os.environ.get("KIWI_DEV_JWT_SECRET", "")
 
+    # ── Iteración 2: evaluación y revisión humana ──────────────────────────
+    # Subs (JWT `sub`) autorizados a revisar respuestas libres pendientes.
+    # CSV; VACÍO por defecto => nadie puede revisar => los exámenes con
+    # respuestas libres pendientes permanecen pendientes (sin veredicto).
+    # La autorización se resuelve SIEMPRE contra el sub del token verificado,
+    # nunca contra datos enviados por el cliente.
+    REVIEWER_USERS: str = os.environ.get("KIWI_REVIEWER_USERS", "")
+
+    # Margen de red/reloj sobre el límite del examen (segundos)
+    EXAM_GRACE_SECONDS: int = int(os.environ.get("KIWI_EXAM_GRACE_SECONDS", "30"))
+
     # Persistencia SQL opcional (Supabase/Postgres o SQLite). Vacío = archivos JSON.
     #   postgresql://user:pass@host:port/db   (Supabase: Settings -> Database -> URI)
     #   sqlite:///ruta/kiwi.db

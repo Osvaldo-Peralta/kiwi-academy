@@ -204,6 +204,13 @@ incluir 1 free_text de síntesis (entra al reporte para feedback con IA),
 y **tags consistentes con las lecciones** (el diagnóstico cruza tags →
 lecciones donde repasarlo).
 
+**Iteración 2 — revisión humana:** un examen con respuestas libres
+contestadas queda `pending_review` (resultado provisional sobre la parte
+automática; las keywords NO puntúan). Un revisor autorizado
+(`KIWI_REVIEWER_USERS`) asigna los puntos definitivos vía
+`POST /api/v1/reviews/attempts/{id}`. Diseña las free_text con
+`model_answer` rico y `keywords` realistas: son la guía del revisor.
+
 ## Cómo se calcula el progreso
 
 - **Ejercicio dominado:** acertado al menos una vez (autocorregibles).
