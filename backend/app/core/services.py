@@ -580,9 +580,24 @@ class LearningService:
             "question_feedback": question_feedback,
         }
 
-        # Persiste bajo la PROPIEDAD original (guarda en el store)
-        if not self.progress.update_attempt(owner_id or "", attempt.model_dump(mode="json")):
-            raise NotFoundError(f"Intento no encontrado al guardar la revisión: {attempt_id}")
+        # Transición ATÓMICA pending_review -> reviewed (CAS en el store):
+        # exactamente una revisión concurrente gana. Los efectos secundarios
+        # (agregados del propietario, reporte) se ejecutan SOLO tras ganar;
+        # el perdedor recibe un conflicto controlado (409) sin duplicarlos.
+        won = self.progress.update_attempt_if_status(
+            owner_id or "", attempt.id, "pending_review",
+            attempt.model_dump(mode="json"),
+        )
+        if not won:
+            _, current = self.progress.find_attempt_any_user(attempt_id)
+            if not current:
+                raise NotFoundError(f"Intento no encontrado: {attempt_id}")
+            raise ExamStateError(
+                "El intento ya no está pendiente de revisión: otra revisión "
+                "completó la transición primero (conflicto controlado; esta "
+                "solicitud no tuvo efectos).",
+                reason="not_pending",
+            )
 
         # Agregados del examen en el progreso del propietario
         if owner_id:

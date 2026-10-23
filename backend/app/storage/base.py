@@ -59,6 +59,25 @@ class ProgressStore(ABC):
         ...
 
     @abstractmethod
+    def update_attempt_if_status(
+        self, user_id: str, attempt_id: str,
+        expected_status: str, attempt: dict[str, Any],
+    ) -> bool:
+        """Compare-And-Swap atómico: actualiza el intento SOLO si su
+        score.status actual == expected_status. Devuelve True si esta llamada
+        ganó la transición; False si el intento no existe, no pertenece al
+        usuario, u otra operación ya cambió el estado (condición de carrera
+        resuelta: exactamente un ganador).
+
+        Garantías por implementación:
+        - JSON: lock reentrante por ruta (serializa lectores/escritores del
+          proceso; el store JSON es single-proceso por diseño — ver docs).
+        - SQL: transacción con bloqueo de fila (Postgres FOR UPDATE) o
+          BEGIN IMMEDIATE (SQLite), commit único.
+        """
+        ...
+
+    @abstractmethod
     def get_attempt(self, user_id: str, attempt_id: str) -> Optional[dict[str, Any]]: ...
 
     @abstractmethod
