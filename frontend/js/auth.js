@@ -227,15 +227,23 @@ export async function clearInvalidSession() {
     let confirmed = false;
     try {
       const res = await sbClient.auth.signOut({ scope: "local" });
-      // Contrato vendorizado (2.118.0): signOut devuelve {error|null} y solo
-      // a veces lanza. Éxito confirmado == objeto devuelto sin .error.
-      confirmed = !!res && !res.error;
+      // Confirmación ESTRICTA del éxito (observación de auditoría, rev3):
+      // el resultado debe existir, ser objeto, CONTENER la propiedad 'error'
+      // y valer esta exactamente null — la estructura documentada del
+      // contrato vendorizado (supabase-js 2.118.0: {error: null}).
+      // Cualquier resultado ausente o inesperado (undefined, {}, valores no
+      // objeto, {error: false}, ...) cuenta como NO confirmado y activa la
+      // purga de recuperación.
+      confirmed = !!res
+        && typeof res === "object"
+        && Object.prototype.hasOwnProperty.call(res, "error")
+        && res.error === null;
       if (!confirmed) {
         // Solo el nombre/tipo del error: nunca el objeto completo (podría
         // contener datos de sesión). Sin secretos ni PII en logs.
         console.warn(
-          "auth: signOut(local) devolvió error; purgando sesión persistida.",
-          res?.error?.name || "(sin nombre)",
+          "auth: signOut(local) no confirmó éxito; purgando sesión persistida.",
+          res?.error?.name || (res === undefined ? "resultado ausente" : "resultado inesperado"),
         );
       }
     } catch (e) {

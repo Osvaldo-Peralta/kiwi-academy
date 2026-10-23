@@ -261,5 +261,25 @@ check("C2c: excepción manejada (dos 401 sin crash)", e1?.status === 401 && e2?.
 check("C2c: sesión purgada tras excepción (storage y getCurrentUser)", dom.window.localStorage.getItem(SB_KEY) === null && (await auth.getCurrentUser()) === null);
 check("C2c: exactamente UNA redirección, sin bucle", dom.window.location.hash === "#/auth" && hashChangeCount - hashBase3 === 1);
 
+// ── Escenario 4 (rev3): resultados MALFORMADOS de signOut -> no confirman éxito -> purga
+// (observación de auditoría: confirmed exige estructura exacta {error: null})
+installMockSession();
+auth._setSbClientForTests(mockClient(async () => ({})));                 // objeto sin propiedad 'error'
+try { await apiMod.dashboard(); } catch (e) { /* 401 esperado */ }
+await sleep(80);
+check("C2d: resultado {} -> purga ejecutada, sesión no queda como limpia", dom.window.localStorage.getItem(SB_KEY) === null && (await auth.getCurrentUser()) === null);
+
+installMockSession();
+auth._setSbClientForTests(mockClient(async () => undefined));            // resultado ausente
+try { await apiMod.dashboard(); } catch (e) { /* 401 esperado */ }
+await sleep(80);
+check("C2d: resultado undefined -> purga ejecutada", dom.window.localStorage.getItem(SB_KEY) === null && (await auth.getCurrentUser()) === null);
+
+installMockSession();
+auth._setSbClientForTests(mockClient(async () => ({ error: false })));   // valor inesperado (no null)
+try { await apiMod.dashboard(); } catch (e) { /* 401 esperado */ }
+await sleep(80);
+check("C2d: resultado {error:false} -> purga ejecutada", dom.window.localStorage.getItem(SB_KEY) === null && (await auth.getCurrentUser()) === null);
+
 console.log(failures === 0 ? "\n🎉 FRONTEND OK — todas las verificaciones pasaron" : `\n💥 ${failures} verificaciones fallaron`);
 process.exit(failures === 0 ? 0 : 1);
