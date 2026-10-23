@@ -115,13 +115,20 @@ def test_sesion_ajena_rechazada(client):
 
 
 def test_sesion_de_un_solo_uso(client):
+    """Iteración 3: reenviar con la sesión consumida NO crea un segundo
+    intento — reproduce el resultado original (idempotencia). Antes de la
+    Iteración 3 este caso devolvía 409; el cambio de contrato es parte del
+    alcance autorizado (DATA-02)."""
     sid = start(client)
     ok = client.post(SUBMIT_URL, json={"session_id": sid, "responses": full_responses(False)},
                      headers=H("dev-student"))
     assert ok.status_code == 200
+    assert ok.json()["idempotent_replay"] is False
     again = client.post(SUBMIT_URL, json={"session_id": sid, "responses": full_responses(False)},
                         headers=H("dev-student"))
-    assert again.status_code == 409 and again.json()["error"]["reason"] == "session_invalid"
+    assert again.status_code == 200
+    assert again.json()["idempotent_replay"] is True
+    assert again.json()["attempt_id"] == ok.json()["attempt_id"]
 
 
 def test_nueva_sesion_reemplaza_anterior(client):
