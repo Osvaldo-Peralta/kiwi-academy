@@ -101,34 +101,61 @@ def test_sql_fallo_a_media_transaccion_rollback_total(tmp_path, monkeypatch):
     assert len(atts) == 1
 
 
-def test_json_fallo_parcial_se_repara_reconstruyendo(tmp_path, monkeypatch):
+def test_json_fallo_a_media_transaccion_rollback_total(tmp_path, monkeypatch):
+    """Corrección de auditoría (punto 1): el store JSON ya NO deja estados
+    parciales ante un fallo a mitad de la operación compuesta — el diario
+    copy-on-write revierte intento, progreso y reporte."""
     store = make_store("json", tmp_path)
     service = make_service(store)
     sid = start_session(service)
 
-    def flaky_save_progress(user_id, progress):
-        raise RuntimeError("fallo inducido (JSON: sin rollback, hay reparación)")
+    original = store.save_report
 
-    monkeypatch.setattr(store, "save_progress", flaky_save_progress)
+    def flaky_save_report(*a, **k):
+        raise RuntimeError("fallo inducido en el último paso del flujo")
+
+    monkeypatch.setattr(store, "save_report", flaky_save_report)
     with pytest.raises(RuntimeError):
         service.submit_exam("dev-student", COURSE, EXAM, sid, blank_responses())
 
-    # Estado parcial documentado del store JSON: el intento SÍ se escribió
-    # (paso anterior al fallo), los agregados NO.
+    # ROLLBACK: ni intento, ni agregados, ni sesión consumida
+    assert store.list_attempts("dev-student") == []
+    prog = store.load_progress("dev-student")
+    assert prog.get("exams", {}).get(EXAM_KEY) is None
+    session = prog["exam_sessions"][EXAM_KEY]
+    assert "consumed_attempt" not in session
+
+    # reintento limpio con la misma sesión tras sanar el fallo -> 1 intento
+    monkeypatch.setattr(store, "save_report", original)
+    out = service.submit_exam("dev-student", COURSE, EXAM, sid, blank_responses())
+    assert out["idempotent_replay"] is False
     atts = [a for a in store.list_attempts("dev-student") if a["scope"]["type"] == "exam"]
     assert len(atts) == 1
-    prog = store.load_progress("dev-student")
-    assert prog.get("exams", {}).get(EXAM_KEY) is None      # agregado faltante
 
-    # Reparación: los agregados se reconstruyen desde la fuente de verdad
+
+def test_json_recuperacion_automatica_no_necesaria_tras_rollback(tmp_path, monkeypatch):
+    """El estado tras el fallo es consistente SIN intervención: no hace falta
+    repair_progress.py (que queda como mecanismo adicional ante catástrofes
+    externas, p. ej. muerte del proceso)."""
+    store = make_store("json", tmp_path)
+    service = make_service(store)
+    sid = start_session(service)
+
+    def flaky(user_id, progress):
+        raise RuntimeError("fallo inducido en progreso")
+
+    monkeypatch.setattr(store, "save_progress", flaky)
+    with pytest.raises(RuntimeError):
+        service.submit_exam("dev-student", COURSE, EXAM, sid, blank_responses())
+
+    # estado inmediatamente consistente: sin intento huérfano
+    assert store.list_attempts("dev-student") == []
+    # y el flujo completo siguiente funciona sin ninguna reparación manual
     monkeypatch.setattr(store, "save_progress", JsonProgressStore(root=tmp_path).save_progress)
-    out = service.rebuild_progress_from_attempts("dev-student")
-    assert out["exams"] == 1
+    out = service.submit_exam("dev-student", COURSE, EXAM, sid, blank_responses())
     prog = store.load_progress("dev-student")
-    ep = prog["exams"][EXAM_KEY]
-    assert ep["attempts"] == 1
-    assert ep["last_attempt_id"] == atts[0]["id"]
-    assert ep["last_status"] == "auto_graded"               # libres sin responder
+    assert prog["exams"][EXAM_KEY]["attempts"] == 1
+    assert prog["exams"][EXAM_KEY]["last_attempt_id"] == out["attempt_id"]
 
 
 # ---------------------------------------------------------------------------
@@ -275,19 +302,44 @@ def test_sql_report_no_reasigna_propiedad(tmp_path):
     assert ok is not None
 
 
-def test_json_report_estructuralmente_aislado(tmp_path):
+def test_json_report_propiedad_reforzada(tmp_path):
+    """Corrección de auditoría (punto 3): no se puede CREAR un reporte sobre
+    un intento ajeno o inexistente (antes solo se protegía la sobrescritura)."""
     store = make_store("json", tmp_path)
     att = {"id": "att_prop", "user_id": "dev-ana", "submitted_at": "2026-01-01T00:00:00+00:00",
            "scope": {"type": "exam"}, "score": {}}
     store.save_attempt("dev-ana", att)
-    store.save_report("dev-ana", "att_prop", "report.md", "contenido de ana")
-    store.save_report("dev-mallory", "att_prop", "report.md", "contenido usurpado")
 
-    # store.root ya incluye el segmento "users" (convención del store JSON)
-    p_ana = store.root / "dev-ana" / "reports" / "att_prop.report.md"
-    assert p_ana.read_text(encoding="utf-8") == "contenido de ana"   # intacto
-    p_mal = store.root / "dev-mallory" / "reports" / "att_prop.report.md"
-    assert p_mal.exists()   # queda en SU directorio (no toca el ajeno)
+    # atacante: el intento no existe en SU directorio -> denegado, nada creado
+    assert store.save_report("dev-mallory", "att_prop", "report.md", "usurpado") is None
+    reports_mal = store.root / "dev-mallory" / "reports"
+    assert not reports_mal.exists() or not list(reports_mal.glob("*"))
+
+    # intento inexistente -> denegado incluso para usuario legítimo
+    assert store.save_report("dev-ana", "att_ghost", "report.md", "x") is None
+
+    # la dueña sí puede
+    assert store.save_report("dev-ana", "att_prop", "report.md", "contenido de ana") is not None
+    assert (store.root / "dev-ana" / "reports" / "att_prop.report.md").read_text(
+        encoding="utf-8") == "contenido de ana"
+
+
+def test_sql_report_no_se_crea_sobre_intento_ajeno(tmp_path):
+    """Corrección de auditoría (punto 3, SQL): crear un reporte vinculado a
+    un intento ajeno cuando AÚN no existe reporte -> denegado sin efectos."""
+    store = make_store("sqlite", tmp_path)
+    att = {"id": "att_prop", "user_id": "dev-ana", "submitted_at": "2026-01-01T00:00:00+00:00",
+           "scope": {"type": "exam"}, "score": {}}
+    store.save_attempt("dev-ana", att)
+
+    assert store.save_report("dev-mallory", "att_prop", "report.md", "usurpado") is None
+    rows = store._execute([("SELECT COUNT(*) FROM kiwi_reports", ())])[0]
+    assert rows[0][0] == 0                        # ni fila creó
+
+    assert store.save_report("dev-ana", "att_ghost", "report.md", "x") is None   # inexistente
+    assert store.save_report("dev-ana", "att_prop", "report.md", "legítimo") is not None
+    rows = store._execute([("SELECT user_id, content FROM kiwi_reports", ())])[0]
+    assert rows[0][0] == "dev-ana" and rows[0][1] == "legítimo"
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +382,60 @@ def test_rebuild_restaura_y_preserva_flags(tmp_path):
     prog2 = store.load_progress("dev-student")
     assert prog2["exams"] == prog["exams"]
     assert prog2["lessons"][lk]["exercises_mastered"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Corrección de auditoría (punto 2): revisión = UNA unidad transaccional
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("kind", ["json", "sqlite"])
+def test_review_fallo_en_efectos_hace_rollback_del_cas(kind, tmp_path, monkeypatch):
+    """Si un efecto posterior al CAS falla (agregados/reporte), la transición
+    pending->reviewed se REVIERTE: el intento sigue pendiente y la revisión
+    puede reintentarse sin reparación manual."""
+    monkeypatch.setattr(settings, "REVIEWER_USERS", "dev-reviewer")
+    store = make_store(kind, tmp_path)
+    service = make_service(store)
+
+    sess = service.start_exam_session("dev-student", COURSE, EXAM)
+    exam = ContentRepository().get_exam(COURSE, EXAM)
+    responses = [{"exercise_id": q.id,
+                  "answer": q.answer["model_answer"] if q.type == "free_text" else None}
+                 for q in exam.questions]
+    sub = service.submit_exam("dev-student", COURSE, EXAM, sess["session_id"], responses)
+    att_id = sub["attempt_id"]
+    assert sub["score"]["status"] == "pending_review"
+
+    original = store.save_report
+
+    def flaky(*a, **k):
+        raise RuntimeError("fallo inducido en el reporte (último efecto)")
+
+    monkeypatch.setattr(store, "save_report", flaky)
+    with pytest.raises(RuntimeError):
+        service.review_attempt("dev-reviewer", att_id,
+                               [{"exercise_id": "ex-15", "points_earned": 18}])
+
+    # CAS revertido: intento SIGUE pendiente, sin review, agregados intactos
+    _, stored = store.find_attempt_any_user(att_id)
+    assert stored["score"]["status"] == "pending_review"
+    assert stored.get("review") is None
+    prog = store.load_progress("dev-student")
+    ep = prog["exams"][EXAM_KEY]
+    assert ep["last_status"] == "pending_review"
+    assert ep.get("passed") is not True
+
+    # recuperación automática: re-revisar funciona sin repair manual
+    monkeypatch.setattr(store, "save_report", original)
+    out = service.review_attempt("dev-reviewer", att_id,
+                                 [{"exercise_id": "ex-15", "points_earned": 18}])
+    assert out["score"]["status"] == "reviewed"
+    expected_final = round(18 / out["score"]["points_total"] * 100, 1)
+    assert out["score"]["final_percent"] == expected_final
+    assert out["score"]["passed"] is (expected_final >= 70)
+    prog = store.load_progress("dev-student")
+    assert prog["exams"][EXAM_KEY]["best_percent"] == expected_final
+    assert prog["exams"][EXAM_KEY]["last_status"] == "reviewed"
 
 
 # ---------------------------------------------------------------------------

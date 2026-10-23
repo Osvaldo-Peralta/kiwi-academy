@@ -68,8 +68,11 @@ def test_attempts_save_get_list_order_and_isolation(store):
 
 # ------------------------------------------------------------------ reportes
 def test_reports_upsert(store):
+    # Iteración 3 (auditoría): save_report exige que el intento exista y sea
+    # del usuario — flujo legítimo: primero el intento, luego el reporte.
+    store.save_attempt("bob", _attempt("att_1", "2026-10-01T10:00:00Z"))
     ref = store.save_report("bob", "att_1", "report.md", "# v1")
-    assert ref.startswith("sql://")
+    assert ref and ref.startswith("sql://")
     store.save_report("bob", "att_1", "report.md", "# v2")  # upsert sin error
 
 

@@ -636,44 +636,17 @@ class LearningService:
             "question_feedback": question_feedback,
         }
 
-        # Transición ATÓMICA pending_review -> reviewed (CAS en el store):
-        # exactamente una revisión concurrente gana. Los efectos secundarios
-        # (agregados del propietario, reporte) se ejecutan SOLO tras ganar;
-        # el perdedor recibe un conflicto controlado (409) sin duplicarlos.
-        won = self.progress.update_attempt_if_status(
-            owner_id or "", attempt.id, "pending_review",
-            attempt.model_dump(mode="json"),
-        )
-        if not won:
-            _, current = self.progress.find_attempt_any_user(attempt_id)
-            if not current:
-                raise NotFoundError(f"Intento no encontrado: {attempt_id}")
-            raise ExamStateError(
-                "El intento ya no está pendiente de revisión: otra revisión "
-                "completó la transición primero (conflicto controlado; esta "
-                "solicitud no tuvo efectos).",
-                reason="not_pending",
-            )
-
-        # Agregados del examen en el progreso del propietario (Iteración 3:
-        # mutate atómico — DATA-03). El CAS del intento y este mutate son dos
-        # operaciones atómicas individuales; la ventana entre ellas se cubre
-        # con rebuild_progress_from_attempts (recuperación probada).
-        if owner_id:
-            key = exam_key(attempt.scope.course_id, attempt.scope.exam_id or "")
-
-            def _mut(prog: dict[str, Any]) -> None:
-                ep = prog.setdefault("exams", {}).setdefault(
-                    key, {"attempts": 0, "best_percent": 0.0, "passed": False}
-                )
-                ep["best_percent"] = max(ep.get("best_percent", 0.0), final_percent)
-                ep["passed"] = bool(ep.get("passed") or s["passed"])
-                if ep.get("last_attempt_id") == attempt.id:
-                    ep["last_status"] = "reviewed"
-
-            self.progress.mutate_progress(owner_id, _mut)
-
-        # Reporte regenerado con el resultado definitivo
+        # Corrección de auditoría (Iter 3, punto 2): CAS + agregados + reporte
+        # en UNA unidad transaccional cuando el adaptador lo permite:
+        # - SQL: transacción real (la fila de progreso del propietario se
+        #   bloquea con FOR UPDATE; el CAS usa la misma conexión; excepción =>
+        #   ROLLBACK completo: el intento NO queda revisado si un efecto falla).
+        # - JSON: serialización + diario copy-on-write => garantía equivalente
+        #   en proceso (excepción => se restauran intento/progreso/reporte).
+        # La consistencia normal ya NO depende de reparación manual;
+        # repair_progress.py queda como mecanismo adicional ante catástrofes
+        # externas (p. ej. muerte del proceso a mitad de una escritura).
+        key = exam_key(attempt.scope.course_id, attempt.scope.exam_id or "")
         exam = self.content.get_exam(attempt.scope.course_id, attempt.scope.exam_id or "")
         course_title = ""
         try:
@@ -683,8 +656,35 @@ class LearningService:
         md = render_report_markdown(
             attempt, exam.questions, course_title=course_title, scope_title=exam.title,
         )
-        if owner_id:
-            self.progress.save_report(owner_id, attempt.id, "report.md", md)
+
+        with self.progress.transaction(owner_id or ""):
+            won = self.progress.update_attempt_if_status(
+                owner_id or "", attempt.id, "pending_review",
+                attempt.model_dump(mode="json"),
+            )
+            if not won:
+                _, current = self.progress.find_attempt_any_user(attempt_id)
+                if not current:
+                    raise NotFoundError(f"Intento no encontrado: {attempt_id}")
+                raise ExamStateError(
+                    "El intento ya no está pendiente de revisión: otra revisión "
+                    "completó la transición primero (conflicto controlado; esta "
+                    "solicitud no tuvo efectos).",
+                    reason="not_pending",
+                )
+
+            if owner_id:
+                def _mut(prog: dict[str, Any]) -> None:
+                    ep = prog.setdefault("exams", {}).setdefault(
+                        key, {"attempts": 0, "best_percent": 0.0, "passed": False}
+                    )
+                    ep["best_percent"] = max(ep.get("best_percent", 0.0), final_percent)
+                    ep["passed"] = bool(ep.get("passed") or s["passed"])
+                    if ep.get("last_attempt_id") == attempt.id:
+                        ep["last_status"] = "reviewed"
+
+                self.progress.mutate_progress(owner_id, _mut)
+                self.progress.save_report(owner_id, attempt.id, "report.md", md)
 
         return {
             "attempt_id": attempt.id,

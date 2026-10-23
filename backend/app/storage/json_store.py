@@ -151,6 +151,41 @@ class JsonProgressStore(ProgressStore):
 
     def __init__(self, root: Optional[Path] = None):
         self.root = Path(root or settings.DATA_DIR) / "users"
+        self._local = threading.local()   # diario de la transacción en curso
+
+    # -- diario copy-on-write (rollback real en operaciones compuestas) ------
+
+    def _record_original(self, path: Path) -> None:
+        """Registra el contenido original (o la ausencia) de un archivo antes
+        de la primera escritura dentro de la transacción activa."""
+        journal = getattr(self._local, "journal", None)
+        if journal is None:
+            return
+        key = str(path)
+        if key not in journal:
+            journal[key] = path.read_bytes() if path.exists() else None
+
+    def _write_json_journaled(self, path: Path, data: Any) -> None:
+        self._record_original(path)
+        _write_json(path, data)
+
+    @staticmethod
+    def _rollback(journal: dict) -> None:
+        """Restaura los archivos registrados (borra los creados). Best-effort
+        atómico por archivo; repair_progress.py queda como mecanismo adicional
+        ante fallos extremos (p. ej. muerte del proceso a mitad del rollback)."""
+        for path_str in reversed(list(journal.keys())):
+            original = journal[path_str]
+            path = Path(path_str)
+            try:
+                if original is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    tmp = path.with_suffix(path.suffix + ".rbak")
+                    tmp.write_bytes(original)
+                    os.replace(tmp, path)
+            except OSError:
+                pass
 
     # -- progreso -----------------------------------------------------------
 
@@ -164,7 +199,7 @@ class JsonProgressStore(ProgressStore):
         return data or {"user_id": user_id, "lessons": {}, "exams": {}, "activity": {}}
 
     def save_progress(self, user_id: str, progress: dict[str, Any]) -> None:
-        _write_json(self._progress_path(user_id), progress)
+        self._write_json_journaled(self._progress_path(user_id), progress)
 
     # -- intentos (append-only) ---------------------------------------------
 
@@ -174,13 +209,13 @@ class JsonProgressStore(ProgressStore):
         return d
 
     def save_attempt(self, user_id: str, attempt: dict[str, Any]) -> None:
-        _write_json(self._attempts_dir(user_id) / f"{attempt['id']}.json", attempt)
+        self._write_json_journaled(self._attempts_dir(user_id) / f"{attempt['id']}.json", attempt)
 
     def update_attempt(self, user_id: str, attempt: dict[str, Any]) -> bool:
         path = self._attempts_dir(user_id) / f"{attempt['id']}.json"
         if not path.exists():
             return False  # guarda de propiedad: solo actualiza lo existente
-        _write_json(path, attempt)
+        self._write_json_journaled(path, attempt)
         return True
 
     def update_attempt_if_status(
@@ -197,7 +232,7 @@ class JsonProgressStore(ProgressStore):
                 return False
             if (current.get("score") or {}).get("status") != expected_status:
                 return False
-            _write_json(path, attempt)
+            self._write_json_journaled(path, attempt)
             return True
 
     def get_attempt(self, user_id: str, attempt_id: str) -> Optional[dict[str, Any]]:
@@ -229,13 +264,19 @@ class JsonProgressStore(ProgressStore):
 
     def save_report(self, user_id: str, attempt_id: str, name: str, content: str) -> Optional[str]:
         # Propiedad estructural: los reportes viven bajo el directorio del
-        # usuario; es imposible sobrescribir el reporte de OTRO usuario.
+        # usuario. Además (auditoría Iter 3, punto 3): solo se crea/actualiza
+        # un reporte si el intento EXISTE y pertenece a este usuario — se
+        # rechaza vincular reportes a intentos ajenos o inexistentes.
+        safe_attempt = "".join(c for c in attempt_id if c.isalnum() or c in "-_")
+        att_path = self.root / user_id / "attempts" / f"{safe_attempt}.json"
+        if not att_path.exists():
+            return None    # intento inexistente o de otro usuario: denegado
         d = self.root / user_id / "reports"
         d.mkdir(parents=True, exist_ok=True)
-        safe_attempt = "".join(c for c in attempt_id if c.isalnum() or c in "-_")
         safe_name = "".join(c for c in name if c.isalnum() or c in "-_.")
         path = d / f"{safe_attempt}.{safe_name}"
         with _lock_for(str(path)):
+            self._record_original(path)
             path.write_text(content, encoding="utf-8")
         return str(path)
 
@@ -243,11 +284,25 @@ class JsonProgressStore(ProgressStore):
 
     @contextmanager
     def transaction(self, user_id: str) -> Iterator[None]:
-        """Lock global del store: serializa operaciones compuestas
-        (attempt+progreso+reporte) dentro del proceso. El store JSON es
+        """Serializa Y revierte operaciones compuestas dentro del proceso:
+        lock global + diario copy-on-write. Si el bloque lanza, todos los
+        archivos escritos durante la transacción se restauran a su estado
+        original (o se borran si no existían). El store JSON es
         single-proceso por diseño; la garantía multi-worker la da el SQL."""
         with _STORE_LOCK:
-            yield
+            if getattr(self._local, "journal", None) is not None:
+                yield          # anidada: se une a la transacción externa
+                return
+            self._local.journal = {}
+            try:
+                yield
+            except BaseException:
+                journal = self._local.journal
+                self._local.journal = None
+                self._rollback(journal)
+                raise
+            else:
+                self._local.journal = None
 
     def mutate_progress(self, user_id: str, fn: Callable[[dict[str, Any]], Any]) -> Any:
         with _STORE_LOCK:
