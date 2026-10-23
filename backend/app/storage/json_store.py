@@ -171,9 +171,28 @@ class JsonProgressStore(ProgressStore):
     def save_attempt(self, user_id: str, attempt: dict[str, Any]) -> None:
         _write_json(self._attempts_dir(user_id) / f"{attempt['id']}.json", attempt)
 
+    def update_attempt(self, user_id: str, attempt: dict[str, Any]) -> bool:
+        path = self._attempts_dir(user_id) / f"{attempt['id']}.json"
+        if not path.exists():
+            return False  # guarda de propiedad: solo actualiza lo existente
+        _write_json(path, attempt)
+        return True
+
     def get_attempt(self, user_id: str, attempt_id: str) -> Optional[dict[str, Any]]:
         safe = "".join(c for c in attempt_id if c.isalnum() or c in "-_")
         return _read_json(self._attempts_dir(user_id) / f"{safe}.json")
+
+    def find_attempt_any_user(self, attempt_id: str) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+        safe = "".join(c for c in attempt_id if c.isalnum() or c in "-_")
+        if not self.root.exists():
+            return None, None
+        for user_dir in sorted(self.root.iterdir()):
+            if not user_dir.is_dir():
+                continue
+            data = _read_json(user_dir / "attempts" / f"{safe}.json")
+            if data:
+                return user_dir.name, data
+        return None, None
 
     def list_attempts(self, user_id: str, limit: int = 50) -> list[dict[str, Any]]:
         files = sorted(self._attempts_dir(user_id).glob("*.json"), reverse=True)[:limit]

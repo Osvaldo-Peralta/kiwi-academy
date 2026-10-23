@@ -274,8 +274,10 @@ def test_aislamiento_lectura_entre_usuarios(client):
     client.post("/api/v1/courses/soc-n1/modules/01-fundamentos/lessons/01-modelo-osi-protocolos/exercises/l1-e1/attempt",
                 json={"answer": "b"}, headers=ha)
     exam = client.get("/api/v1/courses/soc-n1/exams/fase-1-examen").json()
+    sess = client.post("/api/v1/courses/soc-n1/exams/fase-1-examen/sessions", headers=ha).json()
     sub = client.post("/api/v1/courses/soc-n1/exams/fase-1-examen/attempts",
-                      json={"responses": [{"exercise_id": q["id"], "answer": None}
+                      json={"session_id": sess["session_id"],
+                            "responses": [{"exercise_id": q["id"], "answer": None}
                                           for q in exam["questions"]]}, headers=ha).json()
     # B no ve nada de A
     dash_b = client.get(PROGRESS, headers=hb).json()

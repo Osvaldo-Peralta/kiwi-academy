@@ -220,6 +220,12 @@ class QuestionResult(BaseModel):
     feedback: str = ""
     explanation: str = ""
     tags: list[str] = Field(default_factory=list)
+    # Iteración 2: estado de revisión de la pregunta
+    #   auto         -> corregida automáticamente (definitiva)
+    #   pending      -> respuesta libre enviada, espera revisor humano (0 pts auto)
+    #   reviewed     -> puntuada por revisor humano (definitiva)
+    #   not_answered -> respuesta libre vacía (0 pts, nada que revisar)
+    review_status: Literal["auto", "pending", "reviewed", "not_answered"] = "auto"
 
 
 class AttemptScope(BaseModel):
@@ -243,6 +249,9 @@ class Attempt(BaseModel):
     weak_tags: list[dict[str, Any]] = Field(default_factory=list)
     feedback_summary: str = ""
     recommendations: list[str] = Field(default_factory=list)
+    # Iteración 2: revisión humana (None hasta que un revisor autorizado actúa)
+    # {reviewer: <sub>, reviewed_at: iso, comment: str, question_feedback: {qid: str}}
+    review: Optional[dict[str, Any]] = None
 
 
 class LessonProgress(BaseModel):
@@ -272,6 +281,21 @@ class ExamResponseItem(BaseModel):
 
 
 class ExamSubmission(BaseModel):
+    """Iteración 2: el envío exige una sesión de examen emitida por el
+    servidor (control de tiempo server-side). `started_at`/`duration_seconds`
+    del cliente fueron eliminados del contrato: el servidor mide el tiempo.
+    Campos extra en el payload se ignoran (no son de confianza)."""
+    session_id: str
     responses: list[ExamResponseItem]
-    started_at: Optional[datetime] = None
-    duration_seconds: Optional[int] = None
+
+
+class ExamReviewItem(BaseModel):
+    """Puntuación de un revisor humano para una respuesta libre pendiente."""
+    exercise_id: str
+    points_earned: float = Field(ge=0)
+    feedback: Optional[str] = Field(default=None, max_length=2000)
+
+
+class ExamReviewPayload(BaseModel):
+    reviews: list[ExamReviewItem]
+    comment: Optional[str] = Field(default=None, max_length=4000)

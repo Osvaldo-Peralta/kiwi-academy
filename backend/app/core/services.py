@@ -5,18 +5,28 @@ traduce HTTP <-> servicios; los servicios no saben nada de HTTP.
 """
 from __future__ import annotations
 
+import secrets
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from .errors import NotFoundError, ValidationError
-from .evaluation import grade_exercise
+from .errors import (
+    ExamStateError,
+    NotFoundError,
+    PermissionDeniedError,
+    ValidationError,
+)
+from .evaluation import grade_exercise, validate_exam_responses
 from .feedback import (
     build_attempt_feedback,
     render_attempt_json,
     render_report_markdown,
 )
 from .models import Attempt, Exercise, QuestionResult
+from ..config import settings
 from ..storage.repositories import ContentRepository, ProgressRepository
+
+
+SESSIONS_KEY = "exam_sessions"
 
 
 def _now() -> datetime:
@@ -234,46 +244,137 @@ class LearningService:
         exam = self.content.get_exam(course_id, exam_id)
         return exam.public()
 
+    def start_exam_session(self, user_id: str, course_id: str, exam_id: str) -> dict[str, Any]:
+        """Iteración 2 (EVAL-02): el servidor emite la sesión del examen y
+        mide el tiempo. El temporizador del cliente es solo informativo:
+        la expiración se valida SIEMPRE aquí con reloj de servidor."""
+        exam = self.content.get_exam(course_id, exam_id)
+        now = _now()
+        session_id = secrets.token_urlsafe(16)
+        deadline_unix: Optional[float] = None
+        if exam.time_limit_minutes:
+            deadline_unix = now.timestamp() + exam.time_limit_minutes * 60 + settings.EXAM_GRACE_SECONDS
+
+        prog = self.progress.get_progress(user_id)
+        sessions = prog.setdefault(SESSIONS_KEY, {})
+        key = exam_key(course_id, exam_id)
+        sessions[key] = {
+            "session_id": session_id,
+            "started_at": now.isoformat(),
+            "deadline_unix": deadline_unix,
+        }
+        self.progress.save_progress(user_id, prog)
+        return {
+            "exam_id": exam_id,
+            "session_id": session_id,
+            "server_time_unix": now.timestamp(),
+            "deadline_unix": deadline_unix,
+            "time_limit_minutes": exam.time_limit_minutes,
+            "grace_seconds": settings.EXAM_GRACE_SECONDS if exam.time_limit_minutes else 0,
+        }
+
     def submit_exam(
         self, user_id: str, course_id: str, exam_id: str,
+        session_id: str,
         responses: list[dict[str, Any]],
-        started_at: Optional[str] = None,
-        duration_seconds: Optional[int] = None,
     ) -> dict[str, Any]:
-        exam = self.content.get_exam(course_id, exam_id)
-        q_by_id = {q.id: q for q in exam.questions}
-        seen: set[str] = set()
-        by_id: dict[str, Any] = {}
-        for r in responses:
-            eid = r.get("exercise_id")
-            if eid in q_by_id:
-                by_id[eid] = r.get("answer")
-                seen.add(eid)
+        """Corrige el examen completo.
 
+        Iteración 2:
+        - exige sesión válida emitida por el servidor (una sola vez);
+        - valida ids/duplicados/orden/estructura (rechazo controlado 422);
+        - las respuestas libres con contenido quedan PENDIENTES de revisión
+          humana: el examen no se aprueba ni se reprueba definitivamente;
+        - puntaje provisional (parte automática) separado del definitivo;
+        - el tiempo lo mide el servidor (started_at/duration del cliente no
+          existen en el contrato).
+        """
+        exam = self.content.get_exam(course_id, exam_id)
+        now = _now()
+        key = exam_key(course_id, exam_id)
+
+        # 1) Sesión emitida por el servidor (EVAL-02)
+        prog = self.progress.get_progress(user_id)
+        sessions = prog.get(SESSIONS_KEY, {})
+        session = sessions.get(key)
+        if not session or session.get("session_id") != session_id:
+            raise ExamStateError(
+                "Sesión de examen inválida, inexistente o ya consumida. "
+                "Inicia el examen para que el servidor emita una sesión.",
+                reason="session_invalid",
+            )
+        deadline = session.get("deadline_unix")
+        if deadline is not None and now.timestamp() > float(deadline):
+            # sesión expirada: se invalida (consumida) y se rechaza el envío
+            sessions.pop(key, None)
+            prog[SESSIONS_KEY] = sessions
+            self.progress.save_progress(user_id, prog)
+            raise ExamStateError(
+                "El tiempo límite autorizado ya expiró (verificación de servidor). "
+                "La sesión fue invalidada; inicia el examen de nuevo.",
+                reason="exam_expired",
+            )
+
+        # 2) Validación estricta de respuestas (EVAL-03 / QA-04)
+        by_id = validate_exam_responses(exam, responses)
+
+        # 3) Corrección: parte automática + pendientes de revisión humana
         results: list[QuestionResult] = []
-        points_earned = 0.0
         points_total = 0
+        auto_points_total = 0
+        pending_points_total = 0
+        points_earned_auto = 0.0
         pending_review = 0
         for q in exam.questions:
             answer = by_id.get(q.id)
             outcome = grade_exercise(q, answer)
+            review_status = "auto"
+            if q.type == "free_text":
+                review_status = (outcome.detail or {}).get(
+                    "review_status", "pending" if outcome.needs_review else "not_answered")
             earned = round(q.points * outcome.ratio, 2)
-            points_earned += earned
             points_total += q.points
-            if outcome.needs_review and answer not in (None, "", []):
+            if review_status == "pending":
+                pending_points_total += q.points
                 pending_review += 1
+                earned = 0.0  # ninguna palabra clave suma puntos automáticamente
+            else:
+                auto_points_total += q.points
+                points_earned_auto += earned
             results.append(QuestionResult(
                 exercise_id=q.id, type=q.type, submitted=answer,
                 correct=outcome.correct, partial=(0 < outcome.ratio < 1),
                 points_earned=earned, points_total=q.points,
                 feedback=outcome.feedback, explanation=q.explanation,
-                tags=q.tags,
+                tags=q.tags, review_status=review_status,
             ))
 
-        percent = round((points_earned / points_total) * 100, 1) if points_total else 0.0
-        passed = percent >= exam.pass_score
+        status = "pending_review" if pending_review else "auto_graded"
+        provisional_percent = (
+            round((points_earned_auto / auto_points_total) * 100, 1)
+            if auto_points_total else 0.0
+        )
+        # Criterio de aceptación: pendiente de revisión => NUNCA passed/failed
+        passed = None if status == "pending_review" else (provisional_percent >= exam.pass_score)
+        final_percent = None if status == "pending_review" else provisional_percent
+
         tag_map = self.tag_to_lessons(course_id)
-        summary, weak, recs = build_attempt_feedback(results, percent, passed, tag_map)
+        summary, weak, recs = build_attempt_feedback(results, provisional_percent, passed, tag_map)
+        if status == "pending_review":
+            summary = (
+                f"⏳ Resultado PROVISIONAL sobre la parte automática "
+                f"({pending_review} respuesta(s) libre(s) pendientes de revisión humana; "
+                f"el examen no está aprobado ni reprobado hasta completarla). " + summary
+            )
+            recs.insert(0, (
+                "Espera la revisión humana de tus respuestas libres: hasta entonces "
+                "el veredicto definitivo queda suspendido (los puntos libres no se "
+                "otorgan automáticamente)."
+            ))
+
+        started_iso = session.get("started_at")
+        started_dt = datetime.fromisoformat(started_iso) if started_iso else None
+        duration = int((now - started_dt).total_seconds()) if started_dt else None
 
         attempt = Attempt(
             id=self.progress.new_attempt_id(),
@@ -282,13 +383,20 @@ class LearningService:
                 "type": "exam", "course_id": course_id,
                 "module_id": exam.module_id, "exam_id": exam_id,
             },
-            started_at=datetime.fromisoformat(started_at) if started_at else None,
-            submitted_at=_now(),
-            duration_seconds=duration_seconds,
+            started_at=started_dt,
+            submitted_at=now,
+            duration_seconds=duration,
             score={
-                "points_earned": round(points_earned, 2),
                 "points_total": points_total,
-                "percent": percent,
+                "auto_points_total": auto_points_total,
+                "pending_points_total": pending_points_total,
+                "points_earned_auto": round(points_earned_auto, 2),
+                "points_earned_reviewed": 0.0,
+                "points_earned": round(points_earned_auto, 2),
+                "provisional_percent": provisional_percent,
+                "percent": provisional_percent,
+                "final_percent": final_percent,
+                "status": status,
                 "passed": passed,
                 "pass_score": exam.pass_score,
                 "pending_review": pending_review,
@@ -301,21 +409,24 @@ class LearningService:
         attempt_data = attempt.model_dump(mode="json")
         self.progress.save_attempt(user_id, attempt_data)
 
-        # Actualizar progreso agregado del examen
-        prog = self.progress.get_progress(user_id)
-        key = exam_key(course_id, exam_id)
+        # 4) Consume la sesión (one-shot) y actualiza agregados del examen
+        sessions.pop(key, None)
+        prog[SESSIONS_KEY] = sessions
         ep = prog.setdefault("exams", {}).setdefault(
             key, {"attempts": 0, "best_percent": 0.0, "passed": False}
         )
         ep["attempts"] = ep.get("attempts", 0) + 1
-        ep["best_percent"] = max(ep.get("best_percent", 0.0), percent)
-        ep["passed"] = bool(ep.get("passed") or passed)
         ep["last_attempt_id"] = attempt.id
-        ep["last_attempt_at"] = _now().isoformat()
+        ep["last_attempt_at"] = now.isoformat()
+        ep["last_status"] = status
+        if status == "auto_graded":
+            # solo los veredictos definitivos alimentan best/passed
+            ep["best_percent"] = max(ep.get("best_percent", 0.0), provisional_percent)
+            ep["passed"] = bool(ep.get("passed") or passed)
         self._touch_activity(prog)
         self.progress.save_progress(user_id, prog)
 
-        # Reportes exportables (para feedback con IA/mentor)
+        # 5) Reporte exportable (feedback con IA/mentor)
         course = self.content.get_course(course_id)
         md = render_report_markdown(
             attempt, exam.questions,
@@ -330,6 +441,179 @@ class LearningService:
             "feedback_summary": summary,
             "weak_tags": weak,
             "recommendations": recs,
+            "report_markdown": md,
+        }
+
+    # ------------------------------------------------------------------
+    # Revisión humana (Iteración 2)
+    # ------------------------------------------------------------------
+
+    def _require_reviewer(self, reviewer_sub: str) -> None:
+        allowed = {s.strip() for s in (settings.REVIEWER_USERS or "").split(",") if s.strip()}
+        if reviewer_sub not in allowed:
+            raise PermissionDeniedError(
+                "Tu usuario no está autorizado para revisar exámenes "
+                "(KIWI_REVIEWER_USERS)."
+            )
+
+    def review_data(self, reviewer_sub: str, attempt_id: str) -> dict[str, Any]:
+        """Datos para revisar: intento + preguntas libres pendientes con su
+        respuesta modelo (solo revisores autorizados)."""
+        self._require_reviewer(reviewer_sub)
+        owner_id, data = self.progress.find_attempt_any_user(attempt_id)
+        if not data:
+            raise NotFoundError(f"Intento no encontrado: {attempt_id}")
+        attempt = Attempt.model_validate(data)
+        if attempt.scope.type != "exam":
+            raise ValidationError("Solo los exámenes admiten revisión humana.")
+        exam = self.content.get_exam(attempt.scope.course_id, attempt.scope.exam_id or "")
+        q_by_id = {q.id: q for q in exam.questions}
+        pending = []
+        for r in attempt.results:
+            if r.review_status not in ("pending", "reviewed"):
+                continue
+            q = q_by_id.get(r.exercise_id)
+            item: dict[str, Any] = {
+                "exercise_id": r.exercise_id,
+                "prompt": q.prompt if q else "",
+                "points_total": r.points_total,
+                "points_earned": r.points_earned,
+                "review_status": r.review_status,
+                "submitted": r.submitted,
+                "auto_feedback": r.feedback,
+            }
+            if q and isinstance(q.answer, dict):
+                item["model_answer"] = q.answer.get("model_answer", "")
+                item["keywords"] = q.answer.get("keywords", [])
+            pending.append(item)
+        return {
+            "attempt": {
+                "id": attempt.id,
+                "owner": owner_id,
+                "submitted_at": attempt.submitted_at.isoformat(),
+                "duration_seconds": attempt.duration_seconds,
+                "score": attempt.score,
+                "review": attempt.review,
+            },
+            "exam_title": exam.title,
+            "free_text_questions": pending,
+        }
+
+    def review_attempt(
+        self, reviewer_sub: str, attempt_id: str,
+        reviews: list[dict[str, Any]],
+        comment: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Finaliza un examen pendiente: un revisor autorizado asigna los
+        puntos de cada respuesta libre y se calcula el resultado definitivo."""
+        self._require_reviewer(reviewer_sub)
+        owner_id, data = self.progress.find_attempt_any_user(attempt_id)
+        if not data:
+            raise NotFoundError(f"Intento no encontrado: {attempt_id}")
+        attempt = Attempt.model_validate(data)
+        if attempt.scope.type != "exam":
+            raise ValidationError("Solo los exámenes admiten revisión humana.")
+        if (attempt.score or {}).get("status") != "pending_review":
+            raise ExamStateError(
+                f"El intento no está pendiente de revisión (status="
+                f"{(attempt.score or {}).get('status')}).",
+                reason="not_pending",
+            )
+
+        pending = {r.exercise_id: r for r in attempt.results if r.review_status == "pending"}
+        got_ids = [str(rv.get("exercise_id")) for rv in reviews]
+        if set(got_ids) != set(pending.keys()) or len(got_ids) != len(set(got_ids)):
+            raise ValidationError(
+                "La revisión debe cubrir exactamente una vez cada respuesta "
+                "libre pendiente.",
+                problems=[{
+                    "problem": "review_coverage",
+                    "pending_ids": sorted(pending.keys()),
+                    "got_ids": sorted(set(got_ids)),
+                }],
+            )
+        for rv in reviews:
+            r = pending[str(rv["exercise_id"])]
+            pts = rv.get("points_earned")
+            if not isinstance(pts, (int, float)) or pts < 0 or pts > r.points_total:
+                raise ValidationError(
+                    f"Puntos inválidos para {r.exercise_id}: debe ser un número "
+                    f"entre 0 y {r.points_total:g}.",
+                    problems=[{"problem": "points_out_of_range", "exercise_id": r.exercise_id}],
+                )
+            fb = rv.get("feedback")
+            if fb is not None and (not isinstance(fb, str) or len(fb) > 2000):
+                raise ValidationError(
+                    f"Feedback de {r.exercise_id} debe ser texto de ≤2000 caracteres.",
+                    problems=[{"problem": "feedback_invalid", "exercise_id": r.exercise_id}],
+                )
+
+        # Aplica la revisión
+        reviewed_points = 0.0
+        question_feedback: dict[str, str] = {}
+        for rv in reviews:
+            r = pending[str(rv["exercise_id"])]
+            r.points_earned = round(float(rv["points_earned"]), 2)
+            r.review_status = "reviewed"
+            if rv.get("feedback"):
+                r.feedback = f"{r.feedback} · Revisor: {rv['feedback']}"
+                question_feedback[r.exercise_id] = rv["feedback"]
+            reviewed_points += r.points_earned
+
+        s = dict(attempt.score or {})
+        s["points_earned_reviewed"] = round(reviewed_points, 2)
+        s["points_earned"] = round(s.get("points_earned_auto", 0.0) + reviewed_points, 2)
+        final_percent = (
+            round((s["points_earned"] / s["points_total"]) * 100, 1)
+            if s.get("points_total") else 0.0
+        )
+        s["final_percent"] = final_percent
+        s["percent"] = final_percent
+        s["provisional_percent"] = s.get("provisional_percent", final_percent)
+        s["passed"] = final_percent >= s.get("pass_score", 70)
+        s["status"] = "reviewed"
+        attempt.score = s
+        attempt.review = {
+            "reviewer": reviewer_sub,
+            "reviewed_at": _now().isoformat(),
+            "comment": comment,
+            "question_feedback": question_feedback,
+        }
+
+        # Persiste bajo la PROPIEDAD original (guarda en el store)
+        if not self.progress.update_attempt(owner_id or "", attempt.model_dump(mode="json")):
+            raise NotFoundError(f"Intento no encontrado al guardar la revisión: {attempt_id}")
+
+        # Agregados del examen en el progreso del propietario
+        if owner_id:
+            prog = self.progress.get_progress(owner_id)
+            key = exam_key(attempt.scope.course_id, attempt.scope.exam_id or "")
+            ep = prog.setdefault("exams", {}).setdefault(
+                key, {"attempts": 0, "best_percent": 0.0, "passed": False}
+            )
+            ep["best_percent"] = max(ep.get("best_percent", 0.0), final_percent)
+            ep["passed"] = bool(ep.get("passed") or s["passed"])
+            if ep.get("last_attempt_id") == attempt.id:
+                ep["last_status"] = "reviewed"
+            self.progress.save_progress(owner_id, prog)
+
+        # Reporte regenerado con el resultado definitivo
+        exam = self.content.get_exam(attempt.scope.course_id, attempt.scope.exam_id or "")
+        course_title = ""
+        try:
+            course_title = self.content.get_course(attempt.scope.course_id).title
+        except NotFoundError:
+            pass
+        md = render_report_markdown(
+            attempt, exam.questions, course_title=course_title, scope_title=exam.title,
+        )
+        if owner_id:
+            self.progress.save_report(owner_id, attempt.id, "report.md", md)
+
+        return {
+            "attempt_id": attempt.id,
+            "score": attempt.score,
+            "review": attempt.review,
             "report_markdown": md,
         }
 
@@ -411,6 +695,7 @@ class LearningService:
                             "attempts": ep.get("attempts", 0),
                             "best_percent": ep.get("best_percent", 0),
                             "passed": ep.get("passed", False),
+                            "last_status": ep.get("last_status"),
                         }
                         if ep.get("attempts"):
                             overall["exams_taken"] += 1
@@ -461,6 +746,7 @@ class LearningService:
                    or (a.get("scope") or {}).get("exercise_id"),
             "percent": (a.get("score") or {}).get("percent"),
             "passed": (a.get("score") or {}).get("passed"),
+            "status": (a.get("score") or {}).get("status"),
             "submitted_at": a.get("submitted_at"),
         }
 

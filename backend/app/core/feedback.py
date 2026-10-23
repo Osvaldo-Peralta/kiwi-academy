@@ -168,13 +168,19 @@ def render_report_markdown(
     course_title: str = "",
     scope_title: str = "",
 ) -> str:
-    """Reporte completo con respuestas del estudiante vs. correctas.
+    """Reporte completo con respuestas del estudiante vs. las correctas.
 
     Está pensado para copiar/pegar en un chat con una IA (o mentor) y
     recibir feedback cualitativo profundo.
+
+    Iteración 2: distingue resultado provisional (parte automática) del
+    definitivo; las respuestas libres pendientes se marcan explícitamente y
+    su cobertura de palabras clave se presenta como ORIENTATIVA (nunca como
+    prueba de comprensión).
     """
     ex_by_id = {e.id: e for e in exercises}
     score = attempt.score or {}
+    status = score.get("status", "auto_graded")
     lines: list[str] = []
     lines.append(f"# Reporte de evaluación — {scope_title or attempt.scope.type}")
     lines.append("")
@@ -184,11 +190,36 @@ def render_report_markdown(
     lines.append(f"**Fecha:** {attempt.submitted_at.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
     if attempt.duration_seconds:
         lines.append(f"**Duración:** {attempt.duration_seconds // 60} min {attempt.duration_seconds % 60} s")
-    lines.append(
-        f"**Puntaje:** {score.get('points_earned', 0):g}/{score.get('points_total', 0):g} "
-        f"({score.get('percent', 0):.0f}%) — "
-        + ("APROBADO" if score.get("passed") else ("NO APROBADO" if score.get("passed") is not None else "PENDIENTE DE REVISIÓN"))
-    )
+
+    if status == "pending_review":
+        lines.append(
+            f"**Puntaje automático (PROVISIONAL):** {score.get('points_earned_auto', 0):g}/"
+            f"{score.get('auto_points_total', 0):g} de la parte automática "
+            f"({score.get('provisional_percent', 0):.0f}%) — total del examen "
+            f"{score.get('points_total', 0):g} pts"
+        )
+        lines.append(
+            f"**Estado:** ⏳ PENDIENTE DE REVISIÓN HUMANA — "
+            f"{score.get('pending_review', 0)} respuesta(s) libre(s) por valor de "
+            f"{score.get('pending_points_total', 0):g} pts. El examen NO está "
+            f"aprobado ni reprobado hasta que un revisor autorizado las puntúe."
+        )
+    else:
+        verdict = "APROBADO" if score.get("passed") else "NO APROBADO"
+        prefix = ("**Resultado definitivo (revisión humana completada):**"
+                  if status == "reviewed" else "**Puntaje:**")
+        lines.append(
+            f"{prefix} {score.get('points_earned', 0):g}/{score.get('points_total', 0):g} "
+            f"({score.get('percent', 0):.0f}%) — {verdict}"
+        )
+
+    if attempt.review:
+        rv = attempt.review
+        lines.append("")
+        lines.append(f"**Revisión humana:** por `{rv.get('reviewer')}` el {rv.get('reviewed_at')}")
+        if rv.get("comment"):
+            lines.append(f"> Comentario del revisor: {rv['comment']}")
+
     lines.append("")
     lines.append(f"> Resumen automático: {attempt.feedback_summary}")
     if attempt.recommendations:
@@ -199,9 +230,17 @@ def render_report_markdown(
     lines.append("## Detalle pregunta por pregunta")
     for i, r in enumerate(attempt.results, start=1):
         ex = ex_by_id.get(r.exercise_id)
-        status = "✅" if r.correct else ("❌" if r.correct is False else "🕵️ (revisión pendiente)")
+        rs = getattr(r, "review_status", "auto")
+        if rs == "pending":
+            icon = "🕵️ pendiente de revisión humana — 0 pts automáticos"
+        elif rs == "reviewed":
+            icon = f"✍️ revisada por humano — {r.points_earned:g} pts"
+        elif rs == "not_answered":
+            icon = "⬜ sin respuesta"
+        else:
+            icon = "✅" if r.correct else "❌"
         lines.append("")
-        lines.append(f"### {i}. [{status}] {r.exercise_id} · {r.points_earned:g}/{r.points_total:g} pts · tags: {', '.join(r.tags) or '—'}")
+        lines.append(f"### {i}. [{icon}] {r.exercise_id} · {r.points_earned:g}/{r.points_total:g} pts · tags: {', '.join(r.tags) or '—'}")
         if ex:
             lines.append("")
             lines.append(f"**Pregunta:** {ex.prompt}")
@@ -226,6 +265,13 @@ def render_report_markdown(
                 lines.append(f"**Explicación:** {ex.explanation}")
             lines.append("")
             lines.append(f"**Feedback del sistema:** {r.feedback}")
+            if rs in ("pending", "reviewed"):
+                lines.append("")
+                lines.append(
+                    "> Nota: la cobertura de palabras clave es ORIENTATIVA y no "
+                    "constituye prueba de comprensión; la puntuación de esta "
+                    "respuesta la asigna (o asignó) un revisor humano."
+                )
     lines.append("")
     lines.append("---")
     lines.append(
@@ -235,6 +281,8 @@ def render_report_markdown(
         "2. Señala patrones (¿leo mal los logs? ¿confundo capas? ¿me falta vocabulario técnico?).\n"
         "3. Proponme 3 ejercicios prácticos nuevos para mis áreas débiles.\n"
         "4. Evalúa cómo respondería esto en una entrevista real de SOC N1.\n"
+        + ("5. Para las respuestas libres pendientes: valora su calidad real más allá de las palabras clave y sugiere una puntuación justa (0–máx) con criterios.\n"
+           if status == "pending_review" else "")
     )
     return "\n".join(lines)
 
