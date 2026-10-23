@@ -1,7 +1,49 @@
-// Vista: Panel principal (dashboard)
+// Vista: Panel principal (dashboard con sesión) y bienvenida (invitados).
 import { api } from "../api.js";
 import { el, fmtDate, ring } from "../util.js";
 
+// ---------------------------------------------------------------------------
+// Invitados (sin sesión): catálogo público + CTA de auth
+// ---------------------------------------------------------------------------
+export async function renderWelcome(root) {
+  root.innerHTML = "";
+  root.appendChild(
+    el("div", { class: "hero" },
+      el("div", { style: "font-size:34px" }, "🥝"),
+      el("div", { class: "hero-text" },
+        el("h2", {}, "Kiwi Academy — aprende ciberseguridad practicando"),
+        el("p", {}, "Explora el contenido público o inicia sesión para guardar tu progreso, ejercicios y exámenes."),
+      ),
+      el("a", { class: "btn primary", href: "#/auth" }, "Iniciar sesión →"),
+    ),
+  );
+
+  const { courses } = await api.listCourses();
+  const grid = el("div", { class: "grid cols-2" });
+  for (const c of courses) {
+    grid.appendChild(
+      el("a", { class: "card course-card", href: `#/curso/${c.id}`, style: "display:block" },
+        el("h3", {}, `🎓 ${c.title}`),
+        el("p", { style: "font-size:13px;color:var(--text-dim);margin:6px 0" },
+          (c.description || "").slice(0, 180) + "…"),
+        el("div", { style: "display:flex;gap:8px;flex-wrap:wrap;margin-top:8px" },
+          el("span", { class: "badge cyan" }, `${c.modules} módulos`),
+          el("span", { class: "badge dim" }, c.level),
+          c.estimated_weeks ? el("span", { class: "badge dim" }, c.estimated_weeks) : null,
+        ),
+      ),
+    );
+  }
+  root.appendChild(grid);
+  root.appendChild(
+    el("p", { style: "margin-top:18px;font-size:13px;color:var(--text-faint);text-align:center" },
+      "Como invitado puedes leer teoría y ejemplos; los ejercicios evaluados y exámenes requieren sesión."),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Panel personal (requiere sesión)
+// ---------------------------------------------------------------------------
 export async function renderDashboard(root) {
   root.innerHTML = "";
   const dash = await api.dashboard();

@@ -1,10 +1,13 @@
 // Vista: examen (intro -> examen cronometrado -> resultados con revisión)
+// Iteración 1: presentar exámenes requiere sesión (identidad JWT).
 import { api } from "../api.js";
+import { getCurrentUser } from "../auth.js";
 import { el, escapeHtml, fmtClock, toast } from "../util.js";
 import { createExerciseWidget } from "../components/exercises.js";
 
 export async function renderExam(root, courseId, examId) {
   root.innerHTML = "";
+  const user = await getCurrentUser();
   let exam;
   try {
     exam = await api.getExam(courseId, examId);
@@ -12,11 +15,11 @@ export async function renderExam(root, courseId, examId) {
     root.appendChild(el("div", { class: "empty-state" }, el("div", { class: "big" }, "🚫"), e.message));
     return;
   }
-  renderIntro(root, courseId, exam);
+  renderIntro(root, courseId, exam, user);
 }
 
 // ------------------------------------------------------------------ intro
-function renderIntro(root, courseId, exam) {
+function renderIntro(root, courseId, exam, user) {
   root.appendChild(
     el("div", { class: "exam-intro" },
       el("div", { class: "page-head", style: "text-align:center" },
@@ -38,9 +41,13 @@ function renderIntro(root, courseId, exam) {
           el("li", {}, "Intentos ilimitados: cada uno queda en tu historial para medir mejora."),
         ),
         el("div", { style: "display:flex;gap:10px;margin-top:18px;justify-content:center" },
-          el("button", { class: "btn primary lg", onclick: () => startExam(root, courseId, exam) }, "▶ Comenzar examen"),
+          user
+            ? el("button", { class: "btn primary lg", onclick: () => startExam(root, courseId, exam) }, "▶ Comenzar examen")
+            : el("a", { class: "btn primary lg", href: "#/auth" }, "🔒 Inicia sesión para presentar"),
           el("a", { class: "btn ghost lg", href: `#/curso/${courseId}` }, "Volver al roadmap"),
         ),
+        user ? null : el("p", { class: "auth-note", style: "text-align:center" },
+          "Los exámenes guardan resultados e informes asociados a tu identidad verificada: requieren sesión."),
       ),
     ),
   );

@@ -25,11 +25,14 @@ ejecutar cada evolución prevista (de "un estudiante en local" a "academia con
    visible en el payload). Hay **tests anti-fuga** que escanean la respuesta
    HTTP completa buscando `"answer"`, `"explanation"`, etc.
 
-4. **Multiusuario desde el día 1 (aunque hoy seas uno).** Toda lectura/
-   escritura de datos pasa por `user_id` (header `X-User-Id`, default
-   `"default"`). La dependencia `get_user_id()` es el único punto a cambiar
-   cuando haya autenticación real (JWT/sesión) — el resto del código ya está
-   preparado. Los datos de cada usuario viven en directorios separados.
+4. **Multiusuario real (Iteración 1 implementada).** La identidad proviene
+   **exclusivamente del JWT verificado en el backend** (Supabase Auth en
+   producción; emisor dev en local — misma verificación, distinto emisor).
+   La antigua cabecera `X-User-Id` fue eliminada: ya no se lee en ningún
+   punto. `deps.get_current_user()` es el único punto donde se establece la
+   identidad; los stores siguen filtrando todos los datos por `user_id`
+   (= `sub` del token), y los tests de aislamiento (QA-02) lo verifican con
+   pruebas negativas de suplantación.
 
 5. **Historial append-only.** Cada intento (ejercicio suelto o examen) se
    guarda como un archivo JSON inmutable en `data/users/<uid>/attempts/`.

@@ -18,9 +18,8 @@
       <a href="#/curso/soc-n1" data-nav="course">Curso SOC N1</a>
       <a href="#/historial" data-nav="historial">Historial</a>
     </nav>
-    <div class="user-chip" title="Usuario local (header X-User-Id)">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
-      <span id="user-id-label">default</span>
+    <div class="user-chip" id="session-chip" title="Sesión (JWT verificado por el backend)">
+      <span class="chip-user">…</span>
     </div>
   </header>
 
@@ -34,6 +33,11 @@
   </footer>
 
   <div id="toast-container"></div>
+  <!-- supabase-js vendorizado (ver frontend/js/vendor/PROVENANCE.md).
+       Debe cargarse ANTES del módulo app.js: los scripts defer y los módulos
+       se ejecutan en orden de documento. En modo local/test el bundle se
+       carga pero no se usa. -->
+  <script defer src="js/vendor/supabase-js-2.118.0.js"></script>
   <script type="module" src="js/app.js"></script>
 </body>
 </html>

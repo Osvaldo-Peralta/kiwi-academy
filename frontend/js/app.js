@@ -1,38 +1,62 @@
 // Router principal de la SPA (hash-based, sin dependencias).
 //
 // Rutas:
-//   #/                                     -> dashboard
-//   #/curso/:courseId                      -> roadmap del curso
-//   #/leccion/:courseId/:moduleId/:lessonId-> lección (teoría/ejemplos/ejercicios)
-//   #/curso/:courseId/examen/:examId       -> examen
-//   #/historial                            -> historial de intentos
-//
-// Añadir una vista nueva = añadir una ruta aquí. Nada más.
+//   #/                                     -> dashboard (con sesión) o bienvenida (invitado)
+//   #/auth                                 -> entrada de sesión / modo dev
+//   #/curso/:courseId                      -> roadmap del curso (público; progreso si hay sesión)
+//   #/leccion/:courseId/:moduleId/:lessonId-> lección (pública; práctica requiere sesión)
+//   #/curso/:courseId/examen/:examId       -> examen (requiere sesión)
+//   #/historial                            -> historial de intentos (requiere sesión)
 
-import { api, USER_ID } from "./api.js";
+import { loadAuthConfig, getCurrentUser, onAuthChange, signOut } from "./auth.js";
 import { el, toast } from "./util.js";
-import { renderDashboard } from "./views/dashboard.js";
+import { renderDashboard, renderWelcome } from "./views/dashboard.js";
 import { renderCourse } from "./views/course.js";
 import { renderLesson } from "./views/lesson.js";
 import { renderExam } from "./views/exam.js";
 import { renderHistorial } from "./views/historial.js";
+import { renderAuth } from "./views/auth.js";
 
 const app = document.getElementById("app");
-document.getElementById("user-id-label").textContent = USER_ID;
 
 const ROUTES = [
-  { re: /^#\/$/, view: () => renderDashboard(app), nav: "dashboard" },
-  { re: /^#\/curso\/([\w-]+)$/, view: (m) => renderCourse(app, m[1]), nav: "course" },
-  { re: /^#\/leccion\/([\w-]+)\/([\w-]+)\/([\w-]+)$/, view: (m) => renderLesson(app, m[1], m[2], m[3]), nav: "course" },
-  { re: /^#\/curso\/([\w-]+)\/examen\/([\w-]+)$/, view: (m) => renderExam(app, m[1], m[2]), nav: "course" },
-  { re: /^#\/historial$/, view: () => renderHistorial(app), nav: "historial" },
+  { re: /^#\/$/, view: renderHome, nav: "dashboard" },
+  { re: /^#\/auth$/, view: (m, root) => renderAuth(root), nav: "auth" },
+  { re: /^#\/curso\/([\w-]+)$/, view: (m, root) => renderCourse(root, m[1]), nav: "course" },
+  { re: /^#\/leccion\/([\w-]+)\/([\w-]+)\/([\w-]+)$/, view: (m, root) => renderLesson(root, m[1], m[2], m[3]), nav: "course" },
+  { re: /^#\/curso\/([\w-]+)\/examen\/([\w-]+)$/, view: (m, root) => renderExam(root, m[1], m[2]), nav: "course" },
+  { re: /^#\/historial$/, view: (m, root) => renderHistorial(root), nav: "historial" },
 ];
+
+async function renderHome(m, root) {
+  const user = await getCurrentUser();
+  if (user) await renderDashboard(root);
+  else await renderWelcome(root);
+}
+
+async function updateChip() {
+  const chip = document.getElementById("session-chip");
+  if (!chip) return;
+  chip.innerHTML = "";
+  let user = null;
+  try { user = await getCurrentUser(); } catch { /* sin backend aún */ }
+  if (user) {
+    chip.append(
+      el("span", { class: "chip-user", title: user.id }, `👤 ${user.label}${user.anonymous ? " (invitado)" : ""}`),
+      el("button", {
+        class: "chip-btn", title: "Cerrar sesión",
+        onclick: async () => { await signOut(); toast("Sesión cerrada"); updateChip(); route(); },
+      }, "salir"),
+    );
+  } else {
+    chip.append(el("a", { class: "chip-user", href: "#/auth" }, "iniciar sesión"));
+  }
+}
 
 async function route() {
   const hash = location.hash || "#/";
   app.classList.remove("wide");
 
-  // highlight de navegación
   let navActive = null;
   for (const r of ROUTES) {
     const m = hash.match(r.re);
@@ -43,19 +67,18 @@ async function route() {
   });
 
   app.innerHTML = "";
-  const loading = el("div", { class: "boot-loading" }, el("div", { class: "spinner" }), "Cargando…");
-  app.appendChild(loading);
+  app.appendChild(el("div", { class: "boot-loading" }, el("div", { class: "spinner" }), "Cargando…"));
 
   try {
     for (const r of ROUTES) {
       const m = hash.match(r.re);
       if (m) {
-        await r.view(m);
+        app.innerHTML = "";
+        await r.view(m, app);
         window.scrollTo({ top: 0 });
         return;
       }
     }
-    // 404
     app.innerHTML = "";
     app.appendChild(
       el("div", { class: "empty-state" },
@@ -80,10 +103,18 @@ async function route() {
   }
 }
 
-window.addEventListener("hashchange", route);
-window.addEventListener("DOMContentLoaded", () => { if (!location.hash) location.hash = "#/"; route(); });
+async function boot() {
+  try {
+    await loadAuthConfig();
+  } catch (e) {
+    // backend caído: las vistas mostrarán su estado de error igualmente
+    console.warn("No se pudo cargar /api/v1/config:", e.message);
+  }
+  onAuthChange(() => { updateChip(); route(); });
+  window.addEventListener("hashchange", route);
+  await updateChip();
+  if (!location.hash) location.hash = "#/";
+  await route();
+}
 
-// chequeo de salud al cargar
-api.dashboard().catch(() => {
-  toast("No se pudo contactar la API. Asegúrate de correr `python run.py`", "err", 6000);
-});
+boot();

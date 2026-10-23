@@ -112,13 +112,23 @@ docker run -d --name kiwi -p 8000:8000 -v kiwi-data:/app/data kiwi-academy
 
 | Variable | Default | Para qué |
 |----------|---------|----------|
+| `KIWI_AUTH_MODE` | `supabase` | Identidad: `supabase` (producción) / `local` (desarrollo; `run.py` lo usa) / `test` (fixtures) |
+| `SUPABASE_URL` | *(vacío)* | Proyecto Supabase (iss del JWT + JWKS). Obligatorio en modo `supabase` |
+| `SUPABASE_JWT_SECRET` | *(vacío)* | Secreto HS256 legacy. **Secreto**: solo backend. Si tu proyecto usa signing keys asimétricas, déjalo vacío (se usará JWKS) |
+| `SUPABASE_ANON_KEY` | *(vacío)* | Clave pública del navegador (se sirve vía `/api/v1/config`) |
+| `KIWI_JWT_MODE` | `auto` | `auto` (secret si hay secreto, si no jwks) / `secret` / `jwks` |
+| `KIWI_DEV_JWT_SECRET` | *(efímero)* | Secreto estable del emisor dev (modo `local`) |
 | `KIWI_DATABASE_URL` | *(vacío = JSON files)* | `postgresql://...` (Supabase) o `sqlite:///ruta.db` |
 | `KIWI_DATA_DIR` | `<repo>/data` (ó `/tmp/kiwi-academy-data` si no hay permisos) | Dónde vive el progreso (modo archivos) |
 | `KIWI_CONTENT_DIR` | `<repo>/content` | Cursos/lecciones/exámenes |
 | `KIWI_FRONTEND_DIR` | `<repo>/frontend` | SPA estática |
-| `KIWI_DEFAULT_USER` | `default` | Usuario sin header `X-User-Id` |
 | `KIWI_CORS_ORIGINS` | `*` | Restringir en producción (lista CSV) |
 | `KIWI_HOST` / `KIWI_PORT` | `127.0.0.1` / `8000` | Bind del `python run.py` local |
+
+> Nota Iteración 1: `KIWI_DEFAULT_USER` fue **eliminado** — ya no existe
+> usuario implícito; la identidad viene solo del JWT verificado.
+> En modo `supabase` sin configurar, los endpoints privados responden
+> `503 auth_not_configured` (fail-closed): nunca hay identidad implícita.
 
 ## Backup / migración de datos
 
