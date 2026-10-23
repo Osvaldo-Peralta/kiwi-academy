@@ -42,11 +42,12 @@ PROGRESS = "/api/v1/progress"
 # ---------------------------------------------------------------------------
 
 def sb_token(sub=USER_A, secret=SB_SECRET, iss=None, aud="authenticated",
-             exp_delta=3600, alg="HS256", url=SB_URL, drop=()):
+             exp_delta=3600, iat_delta=0, alg="HS256", url=SB_URL, drop=()):
     now = datetime.now(timezone.utc)
     payload = {
         "sub": sub, "aud": aud, "iss": iss or f"{url}/auth/v1",
-        "iat": now, "exp": now + timedelta(seconds=exp_delta),
+        "iat": now + timedelta(seconds=iat_delta),
+        "exp": now + timedelta(seconds=exp_delta),
         "role": "authenticated",
     }
     for k in drop:
@@ -161,10 +162,24 @@ def test_aud_anon_401(client):
     assert r.status_code == 401 and err(r)["reason"] == "invalid"
 
 
-@pytest.mark.parametrize("claim", ["exp", "iss", "aud", "sub"])
+@pytest.mark.parametrize("claim", ["exp", "iat", "iss", "aud", "sub"])
 def test_claims_requeridos(client, claim):
+    # H-02: iat incluido — el contrato documentado exige los 5 claims
     r = client.get(PROGRESS, headers=bearer(sb_token(drop=(claim,))))
     assert r.status_code == 401
+
+
+def test_iat_futuro_fuera_de_margen_401(client):
+    # H-02: iat muy adelantado (reloj manipulado / token pre-fechado)
+    r = client.get(PROGRESS, headers=bearer(sb_token(iat_delta=3600)))
+    assert r.status_code == 401
+    assert err(r)["reason"] == "iat_in_future"
+
+
+def test_iat_futuro_dentro_de_margen_ok(client):
+    # H-02: skew de reloj dentro del leeway (30 s) -> aceptado
+    r = client.get(PROGRESS, headers=bearer(sb_token(iat_delta=10)))
+    assert r.status_code == 200
 
 
 def test_sub_peligroso_rechazado(client):
@@ -348,6 +363,7 @@ def test_rechazo_cruzado_entre_modos(client, monkeypatch):
     # token del emisor local no vale en modo supabase (aunque el secreto coincidiera)
     tok_local = jwt.encode(
         {"sub": "dev-1", "aud": "authenticated", "iss": "kiwi-local-dev",
+         "iat": datetime.now(timezone.utc),
          "exp": datetime.now(timezone.utc) + timedelta(hours=1)},
         SB_SECRET, algorithm="HS256")   # incluso firmado con el secreto supabase
     r = client.get(PROGRESS, headers=bearer(tok_local))
@@ -369,6 +385,7 @@ def test_modo_local_exige_namespace_dev(client, monkeypatch):
     # token bien firmado para local pero con sub sin prefijo dev-
     tok = jwt.encode(
         {"sub": "5b6f1a2e-uuid-real", "aud": "authenticated", "iss": "kiwi-local-dev",
+         "iat": datetime.now(timezone.utc),
          "exp": datetime.now(timezone.utc) + timedelta(hours=1)},
         "dev-secret-local-x", algorithm="HS256")
     r = client.get(PROGRESS, headers=bearer(tok))
@@ -380,6 +397,7 @@ def test_modo_test_con_secreto_fijo(client, monkeypatch):
     reset_verifier()
     tok = jwt.encode(
         {"sub": "dev-fixture", "aud": "authenticated", "iss": "kiwi-test",
+         "iat": datetime.now(timezone.utc),
          "exp": datetime.now(timezone.utc) + timedelta(hours=1)},
         TEST_JWT_SECRET, algorithm="HS256")
     r = client.get(PROGRESS, headers=bearer(tok))

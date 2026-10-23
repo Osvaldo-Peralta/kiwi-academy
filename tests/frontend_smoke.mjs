@@ -21,12 +21,18 @@ const dom = new JSDOM(`<!DOCTYPE html><html><body>
 
 const realFetch = globalThis.fetch;
 const seenHeaders = [];   // evidencia de cabeceras enviadas por api.js
+let configOverride = null; // fase C2: simula config de modo supabase
 globalThis.window = dom.window;
 globalThis.document = dom.window.document;
 globalThis.navigator = dom.window.navigator;
 globalThis.localStorage = dom.window.localStorage;
 globalThis.location = dom.window.location;
 globalThis.fetch = (url, opts) => {
+  if (configOverride && String(url).includes("/api/v1/config")) {
+    return Promise.resolve(new Response(JSON.stringify(configOverride), {
+      status: 200, headers: { "Content-Type": "application/json" },
+    }));
+  }
   seenHeaders.push({ url: String(url), headers: { ...(opts?.headers || {}) } });
   return realFetch(new URL(url, API), opts);
 };
@@ -151,6 +157,50 @@ check("Auth: historial lista intentos", root.querySelectorAll(".hist-table tbody
 // cierre de sesión limpia el token
 await auth.signOut();
 check("signOut limpia token", (await auth.getToken()) === null);
+
+// ------------------------------------------------------------------ FASE C: H-01 sesión inválida/irrecuperable
+// C1 — modo local/test: token corrupto -> 401 -> limpieza completa + redirect
+await auth.devSignIn(SMOKE_USER);
+auth._setDevTokenForTests("token.invalido.dev");
+dom.window.location.hash = "#/";
+let c1Error = null;
+try {
+  const { api } = await import(`${JS}/api.js`);
+  await api.dashboard();
+} catch (e) { c1Error = e; }
+check("C1: petición con token inválido -> error 401", c1Error?.status === 401);
+check("C1: sesión dev limpiada (memoria)", (await auth.getToken()) === null);
+check("C1: sesión dev limpiada (localStorage)", dom.window.localStorage.getItem("kiwi.dev.token") === null);
+check("C1: redirigido a #/auth", dom.window.location.hash === "#/auth");
+check("C1: getCurrentUser ya no muestra sesión activa", (await auth.getCurrentUser()) === null);
+
+// C2 — modo supabase (cliente simulado): sesión muerta -> signOut local + UI coherente
+let signOutCalls = [];
+let fakeSession = { access_token: "sb-token-muerto", user: { id: "u-fake-1", email: "persona@example.com", is_anonymous: false } };
+const fakeSbClient = {
+  auth: {
+    getSession: async () => ({ data: { session: fakeSession } }),
+    signOut: async (opts) => { signOutCalls.push(opts || {}); fakeSession = null; },
+    onAuthStateChange: () => ({ data: { subscription: { unsubscribe() {} } } }),
+  },
+};
+dom.window.supabase = { createClient: () => fakeSbClient };
+configOverride = { auth_mode: "supabase", supabase: { url: "https://fakeref.supabase.co", anon_key: "anon-publica" } };
+await auth.loadAuthConfig(true);
+const guest = await auth.getCurrentUser();
+check("C2: sesión supabase se muestra activa antes del fallo", guest?.label === "persona@example.com");
+
+let c2Error = null;
+try {
+  const { api } = await import(`${JS}/api.js`);
+  await api.dashboard();   // el server (modo test) rechazará "sb-token-muerto" -> 401
+} catch (e) { c2Error = e; }
+check("C2: backend rechaza el token supabase inválido (401)", c2Error?.status === 401);
+check("C2: clearInvalidSession hizo signOut scope=local", signOutCalls.length === 1 && signOutCalls[0].scope === "local");
+check("C2: getCurrentUser ya no muestra la sesión muerta", (await auth.getCurrentUser()) === null);
+
+await renderAuth(root);
+check("C2: la UI de auth NO la muestra como activa", !root.textContent.includes("Sesión activa") && root.textContent.includes("Iniciar sesión"));
 
 console.log(failures === 0 ? "\n🎉 FRONTEND OK — todas las verificaciones pasaron" : `\n💥 ${failures} verificaciones fallaron`);
 process.exit(failures === 0 ? 0 : 1);

@@ -19,7 +19,9 @@ Modos (KIWI_AUTH_MODE):
 Reglas de validación (todos los modos):
 - Algoritmo FIJADO por configuración (defensa contra algorithm confusion y
   alg=none). Nunca se acepta el `alg` del token sin cotejarlo con la lista.
-- Se exigen claims: exp, iss, aud, sub. aud debe ser "authenticated".
+- Se exigen claims: exp, iat, iss, aud, sub. aud debe ser "authenticated".
+- `iat` no puede estar en el futuro fuera del margen (defensa contra tokens
+  pre-fechados / relojes manipulados).
 - iss esperado según modo. Leeway de reloj: 30 s.
 - `sub` debe ser un identificador seguro: [A-Za-z0-9_-]{1,64} (defensa en
   profundidad contra path traversal / inyección en stores) y, en modos
@@ -34,6 +36,7 @@ import logging
 import re
 import secrets
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -53,6 +56,12 @@ LEEWAY_SECONDS = 30
 SUB_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 DEV_SUB_PATTERN = re.compile(r"^dev-[A-Za-z0-9_-]{1,32}$")
 DEV_TOKEN_TTL_SECONDS = 12 * 3600
+
+# H-02: contrato documentado == contrato implementado. `iat` es claim
+# obligatorio (como exp/iss/aud/sub) y se valida además que no esté en el
+# futuro fuera del margen permitido.
+REQUIRED_CLAIMS = ["exp", "iat", "iss", "aud", "sub"]
+_DECODE_OPTIONS = {"require": REQUIRED_CLAIMS}
 
 # Secreto fijo exclusivo para fixtures de prueba (público por diseño: solo
 # tiene sentido con KIWI_AUTH_MODE=test, que NUNCA debe usarse desplegado).
@@ -146,7 +155,7 @@ class Verifier:
                         audience=AUDIENCE,
                         issuer=expected_issuer("supabase"),
                         leeway=timedelta(seconds=LEEWAY_SECONDS),
-                        options={"require": ["exp", "iss", "aud", "sub"]},
+                        options=_DECODE_OPTIONS,
                     )
                 else:
                     if self._jwks_client is None:
@@ -160,7 +169,7 @@ class Verifier:
                         audience=AUDIENCE,
                         issuer=expected_issuer("supabase"),
                         leeway=timedelta(seconds=LEEWAY_SECONDS),
-                        options={"require": ["exp", "iss", "aud", "sub"]},
+                        options=_DECODE_OPTIONS,
                     )
             else:
                 secret = TEST_JWT_SECRET if self.mode == "test" else (
@@ -171,10 +180,17 @@ class Verifier:
                     audience=AUDIENCE,
                     issuer=expected_issuer(self.mode),
                     leeway=timedelta(seconds=LEEWAY_SECONDS),
-                    options={"require": ["exp", "iss", "aud", "sub"]},
+                    options=_DECODE_OPTIONS,
                 )
         except jwt.ExpiredSignatureError as exc:
             raise AuthError("Token expirado", reason="expired") from exc
+        except jwt.ImmatureSignatureError as exc:
+            # H-02: iat en el futuro fuera del margen (PyJWT lo detecta en
+            # decode); se mapea a un reason explícito y auditable.
+            raise AuthError(
+                "Token emitido en el futuro (iat fuera del margen permitido)",
+                reason="iat_in_future",
+            ) from exc
         except jwt.PyJWKClientError as exc:
             # JWKS: kid ausente/desconocido, endpoint inaccesible, etc.
             # Fail-closed: 401, nunca 500.
@@ -182,12 +198,27 @@ class Verifier:
                             reason="invalid") from exc
         except jwt.InvalidTokenError as exc:
             # cubre firma inválida, iss/aud incorrectos, alg no permitido,
-            # claims ausentes, token malformado, alg=none, etc.
+            # claims ausentes (incluido iat, H-02), token malformado,
+            # alg=none, etc.
             raise AuthError("Token inválido", reason="invalid") from exc
 
+        self._check_iat(claims)
         sub = _validate_sub(claims.get("sub"), self.mode)
         claims["sub"] = sub
         return claims
+
+    @staticmethod
+    def _check_iat(claims: dict[str, Any]) -> None:
+        """H-02: `iat` obligatorio (vía options require) y no futuro fuera
+        del margen. PyJWT valida exp/nbf pero NO un iat adelantado."""
+        iat = claims.get("iat")
+        if not isinstance(iat, (int, float)):
+            raise AuthError("Claim 'iat' inválido", reason="invalid")
+        if iat > time.time() + LEEWAY_SECONDS:
+            raise AuthError(
+                "Token emitido en el futuro (iat fuera del margen permitido)",
+                reason="iat_in_future",
+            )
 
     # -- emisión (solo modos local/test) --------------------------------------
 

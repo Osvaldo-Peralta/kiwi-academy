@@ -166,9 +166,33 @@ export async function devSignIn(userId) {
   return data;
 }
 
-// Limpieza cuando el backend rechaza nuestro token (expirado/inválido)
-export function clearInvalidSession() {
-  devToken = null; devUser = null;
+// Limpieza de sesión cuando el backend rechaza nuestro token (inválido/
+// expirado/irrecuperable). H-01: cubre AMBOS modos —
+//   local/test: olvida el token dev (memoria + localStorage)
+//   supabase:   fuerza el cierre LOCAL de la sesión en supabase-js
+//               (scope "local": el token ya es inválido, no tiene sentido
+//               intentar revocarlo en el servidor) — sin esto, getSession()
+//               seguiría devolviendo la sesión muerta y la interfaz la
+//               mostraría como activa.
+// Al final notifica a los suscriptores (chip de sesión, router) para que la
+// UI refleje inmediatamente el estado real.
+export async function clearInvalidSession() {
+  devToken = null;
+  devUser = null;
   localStorage.removeItem(DEV_TOKEN_KEY);
   localStorage.removeItem(DEV_USER_KEY);
+  if (sbClient) {
+    try {
+      await sbClient.auth.signOut({ scope: "local" });
+    } catch (e) {
+      console.warn("clearInvalidSession: signOut local falló", e);
+    }
+  }
+  notifyAuthChange();
+}
+
+// Hook exclusivo para las pruebas smoke: fuerza el token dev en memoria,
+// permitiendo simular una sesión corrupta sin tocar la lógica de producción.
+export function _setDevTokenForTests(tok) {
+  devToken = tok;
 }

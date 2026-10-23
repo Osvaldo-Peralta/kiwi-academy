@@ -26,8 +26,9 @@ async function request(path, options = {}) {
   if (!res.ok) {
     const err = data?.error || {};
     if (res.status === 401 && err.reason !== "missing") {
-      // token presente pero rechazado (expirado/inválido): limpiar sesión
-      clearInvalidSession();
+      // token presente pero rechazado (expirado/inválido/irrecuperable):
+      // limpiar la sesión real (dev Y supabase, H-01) antes de redirigir
+      await clearInvalidSession();
       if (location.hash !== "#/auth") location.hash = "#/auth";
     }
     const e = new Error(err.message || `Error ${res.status}`);
