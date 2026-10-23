@@ -37,6 +37,8 @@ function renderIntro(root, courseId, exam, user) {
         el("ul", { style: "margin:14px 0 0 20px;font-size:13.5px;color:var(--text-dim)" },
           el("li", {}, "Recibes todas las preguntas de una vez y las entregas juntas al final."),
           el("li", {}, "Puedes navegar entre preguntas y dejarlas en cualquier orden."),
+          el("li", {}, "⏱ El temporizador es informativo: **el tiempo límite lo hace cumplir el servidor** (manipularlo no permite excederlo)."),
+          el("li", {}, "✍️ Las respuestas libres quedan **pendientes de revisión humana**: el examen no se aprueba ni se reprueba hasta que un revisor autorizado las puntúe (recibirás un resultado provisional de la parte automática)."),
           el("li", {}, "Al terminar: corrección automática, feedback por pregunta, áreas débiles y reporte exportable para pedir feedback profundo a tu IA/mentor."),
           el("li", {}, "Intentos ilimitados: cada uno queda en tu historial para medir mejora."),
         ),
@@ -58,10 +60,18 @@ function rule(v, k) {
 }
 
 // ------------------------------------------------------------------ examen en curso
-function startExam(root, courseId, exam) {
+async function startExam(root, courseId, exam) {
+  // Iteración 2: la sesión (y el reloj) la emite el SERVIDOR
+  let session;
+  try {
+    session = await api.startExamSession(courseId, exam.id);
+  } catch (e) {
+    toast(`No se pudo iniciar el examen: ${e.message}`, "err", 6000);
+    return;
+  }
+
   root.innerHTML = "";
   root.classList.add("wide");
-  const startedAt = new Date();
   const answers = {};      // exercise_id -> answer
   const widgets = {};      // exercise_id -> widget
   let current = 0;
@@ -99,19 +109,25 @@ function startExam(root, courseId, exam) {
     el("span", {}, el("span", { class: "dot", style: "background:var(--bg-panel);border:1px solid var(--border)" }), "sin responder"),
   ));
 
-  // timer
-  if (exam.time_limit_minutes) {
-    let remaining = exam.time_limit_minutes * 60;
-    timerInterval = setInterval(() => {
-      remaining--;
-      timerEl.textContent = fmtClock(Math.max(0, remaining));
+  // timer basado en el DEADLINE DEL SERVIDOR (con compensación de reloj local).
+  // Manipular el reloj/temporizador del cliente no extiende el límite: el
+  // servidor lo vuelve a comprobar al recibir el envío.
+  const clockOffsetMs = session.server_time_unix * 1000 - Date.now();
+  if (session.deadline_unix) {
+    const tick = () => {
+      const remaining = Math.max(0, Math.round(
+        (session.deadline_unix * 1000 - (Date.now() + clockOffsetMs)) / 1000));
+      timerEl.textContent = fmtClock(remaining);
+      timerEl.title = "Tiempo restante según el reloj del servidor";
       if (remaining <= 300) timerEl.classList.add("low");
       if (remaining <= 0) {
         clearInterval(timerInterval);
-        toast("⏰ Tiempo agotado — entregando automáticamente", "err", 5000);
+        toast("⏰ Tiempo agotado (reloj de servidor) — entregando automáticamente", "err", 5000);
         doSubmit();
       }
-    }, 1000);
+    };
+    tick();
+    timerInterval = setInterval(tick, 1000);
   }
 
   // montar todas las preguntas (se muestran de una en una)
@@ -179,15 +195,30 @@ function startExam(root, courseId, exam) {
     if (timerInterval) clearInterval(timerInterval);
     submitBtn.disabled = true;
     submitBtn.textContent = "Corrigiendo…";
-    const duration = Math.round((Date.now() - startedAt.getTime()) / 1000);
     try {
       const result = await api.submitExam(courseId, exam.id, {
+        session_id: session.session_id,
         responses: questions.map(q => ({ exercise_id: q.id, answer: answers[q.id] ?? null })),
-        started_at: startedAt.toISOString(),
-        duration_seconds: duration,
       });
       renderResults(root, courseId, exam, result);
     } catch (e) {
+      if (e.status === 409) {
+        // Expirado/invalidado por el SERVIDOR: estado claro, sin reintentos
+        root.innerHTML = "";
+        root.classList.remove("wide");
+        root.appendChild(
+          el("div", { class: "exam-intro" },
+            el("div", { class: "card", style: "text-align:center;padding:30px" },
+              el("div", { style: "font-size:40px" }, "⏰"),
+              el("h2", { style: "margin:8px 0" }, "Envío rechazado por el servidor"),
+              el("p", { style: "color:var(--text-dim);margin-bottom:16px" }, e.message),
+              el("a", { class: "btn primary", href: `#/curso/${courseId}/examen/${exam.id}` },
+                "Volver al examen"),
+            ),
+          ),
+        );
+        return;
+      }
       toast(`Error al entregar: ${e.message}`, "err", 6000);
       submitBtn.disabled = false;
       submitBtn.textContent = "Entregar examen";
@@ -213,9 +244,14 @@ function renderResults(root, courseId, exam, result) {
   const s = result.score;
   window.scrollTo({ top: 0 });
 
+  // Iteración 2: tres estados — pending_review (provisional), reviewed, auto_graded
+  const st = s.status || (s.passed === null || s.passed === undefined ? "pending_review" : "auto_graded");
+  const pending = st === "pending_review";
+  const shownPercent = pending ? (s.provisional_percent ?? s.percent ?? 0) : (s.percent ?? 0);
+
   const R = 150, stroke = 12, r = (R - stroke) / 2, c = 2 * Math.PI * r;
-  const off = c * (1 - s.percent / 100);
-  const color = s.passed ? "var(--accent)" : "var(--danger)";
+  const off = c * (1 - shownPercent / 100);
+  const color = pending ? "var(--warn)" : (s.passed ? "var(--accent)" : "var(--danger)");
 
   const scoreRing = el("div", { class: "score-ring" });
   scoreRing.innerHTML = `
@@ -224,14 +260,29 @@ function renderResults(root, courseId, exam, result) {
       <circle cx="${R / 2}" cy="${R / 2}" r="${r}" fill="none" stroke="${color}" stroke-width="${stroke}"
         stroke-linecap="round" stroke-dasharray="${c}" stroke-dashoffset="${off}"/>
     </svg>
-    <div class="val"><b>${Math.round(s.percent)}%</b><span>${s.points_earned}/${s.points_total} pts</span></div>`;
+    <div class="val"><b>${Math.round(shownPercent)}%</b><span>${pending
+      ? `${s.points_earned_auto ?? 0}/${s.auto_points_total ?? 0} pts auto · provisional`
+      : `${s.points_earned}/${s.points_total} pts`}</span></div>`;
+
+  const verdictText = pending
+    ? "⏳ PENDIENTE DE REVISIÓN HUMANA"
+    : s.passed
+      ? (st === "reviewed" ? "✅ APROBADO (revisión completada)" : "✅ APROBADO")
+      : (st === "reviewed" ? "❌ NO APROBADO (revisión completada)" : "❌ NO APROBADO");
 
   root.appendChild(
     el("div", { class: "card result-hero" },
       scoreRing,
-      el("div", { class: `verdict ${s.passed ? "pass" : "fail"}` }, s.passed ? "✅ APROBADO" : "❌ NO APROBADO"),
-      el("p", { style: "color:var(--text-dim);margin-top:6px;max-width:520px;margin-inline:auto" }, result.feedback_summary),
-      s.pending_review ? el("p", { style: "margin-top:8px" }, el("span", { class: "badge warn" }, `🕵️ ${s.pending_review} respuesta(s) libre(s) pendiente(s) de revisión — incluidas en tu reporte`)) : null,
+      el("div", { class: `verdict ${pending ? "pending" : s.passed ? "pass" : "fail"}` }, verdictText),
+      el("p", { style: "color:var(--text-dim);margin-top:6px;max-width:560px;margin-inline:auto" }, result.feedback_summary),
+      pending ? el("div", { class: "pending-box" },
+        el("p", {}, `Tus ${s.pending_review} respuesta(s) libre(s) —por valor de ${s.pending_points_total} pts— esperan la puntuación de un revisor autorizado.`),
+        el("p", {}, "El porcentaje mostrado es PROVISIONAL y cubre solo la parte automática. El examen no está aprobado ni reprobado hasta completar la revisión; la cobertura de palabras clave es orientativa y no puntúa por sí sola."),
+      ) : null,
+      (st === "reviewed" && result.review) ? el("div", { class: "pending-box", style: "border-color:#245c46" },
+        el("p", {}, `✍️ Revisado por ${result.review.reviewer} el ${(result.review.reviewed_at || "").slice(0, 16).replace("T", " ")} UTC`),
+        result.review.comment ? el("p", {}, `Comentario: ${result.review.comment}`) : null,
+      ) : null,
       el("div", { style: "display:flex;gap:10px;justify-content:center;margin-top:16px;flex-wrap:wrap" },
         el("a", { class: "btn ghost", href: `#/curso/${courseId}` }, "← Roadmap"),
         el("button", { class: "btn ghost", onclick: () => location.reload() }, "↺ Reintentar examen"),
@@ -273,7 +324,12 @@ function renderResults(root, courseId, exam, result) {
 
   for (const [i, r] of result.results.entries()) {
     const q = qById[r.exercise_id] || {};
-    const st = r.correct === true ? "✅" : r.correct === false ? (r.partial ? "🟡" : "❌") : "🕵️";
+    const rs = r.review_status || "auto";
+    const st = rs === "pending" ? "🕵️"
+      : rs === "reviewed" ? "✍️"
+      : rs === "not_answered" ? "⬜"
+      : r.correct === true ? "✅"
+      : r.partial ? "🟡" : "❌";
     const bodyEl = el("div", { class: "review-body", style: "display:none" });
     bodyEl.appendChild(kv("Pregunta", q.prompt || r.exercise_id));
     if (q.context?.body) {

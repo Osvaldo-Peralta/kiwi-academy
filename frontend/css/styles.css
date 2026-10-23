@@ -458,6 +458,15 @@ textarea.txt { min-height: 110px; resize: vertical; font-family: var(--sans); fo
 .verdict { font-size: 20px; font-weight: 800; }
 .verdict.pass { color: var(--accent); }
 .verdict.fail { color: var(--danger); }
+.verdict.pending { color: var(--warn); }
+
+.pending-box {
+  max-width: 560px; margin: 14px auto 0; text-align: left;
+  background: var(--warn-soft); border: 1px solid #6e5a26;
+  border-radius: var(--radius-sm); padding: 12px 15px;
+  font-size: 13px; color: var(--text);
+}
+.pending-box p { margin: 4px 0; }
 
 .review-item { border: 1px solid var(--border); border-radius: var(--radius-sm); margin-bottom: 10px; overflow: hidden; }
 .review-head { display: flex; align-items: center; gap: 11px; padding: 12px 15px; cursor: pointer; background: var(--bg-card); font-size: 13.5px; }

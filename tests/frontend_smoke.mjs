@@ -151,6 +151,47 @@ await sleep(1500);
 check("Auth: resultados con anillo y revisión 15", !!root.querySelector(".score-ring") && root.querySelectorAll(".review-item").length === 15);
 check("Auth: exportadores de reporte", [...root.querySelectorAll("button")].some(b => b.textContent.includes("Copiar reporte")));
 
+// ── Iteración 2: examen con respuesta libre contestada -> veredicto PENDIENTE
+await renderExam(root, "soc-n1", "fase-1-examen");
+click([...root.querySelectorAll("button")].find(b => b.textContent.includes("Comenzar examen")));
+await sleep(400);
+const palBtns = root.querySelectorAll(".palette-grid button");
+click(palBtns[14]);                                   // pregunta 15 = respuesta libre
+await sleep(100);
+const ta = root.querySelector(".exam-qcard textarea");
+check("Iter2: pregunta libre accesible desde la paleta", !!ta);
+ta.value = "Brute-force seguido de C2 en 4444: aislar el host, bloquear las IPs, escalar como incidente y preservar evidencia.";
+ta.dispatchEvent(new dom.window.Event("input", { bubbles: true }));
+const submit2 = [...root.querySelectorAll("button")].find(b => b.textContent.includes("Entregar examen"));
+click(submit2);
+await sleep(1800);
+check("Iter2: veredicto PENDIENTE DE REVISIÓN HUMANA en la UI", root.textContent.includes("PENDIENTE DE REVISIÓN HUMANA"));
+check("Iter2: resultado provisional explicado (parte automática)", root.textContent.includes("PROVISIONAL") || root.textContent.includes("provisional"));
+
+// ── Iteración 2: rechazos controlados vía API (sesión + validación)
+const tok = await auth.getToken();
+const r409 = await realFetch(`${API}/api/v1/courses/soc-n1/exams/fase-1-examen/attempts`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json", Authorization: `Bearer ${tok}` },
+  body: JSON.stringify({ session_id: "sesion-falsa", responses: [] }),
+});
+check("Iter2: envío sin sesión válida -> 409", r409.status === 409);
+
+const sess = await (await realFetch(`${API}/api/v1/courses/soc-n1/exams/fase-1-examen/sessions`, {
+  method: "POST", headers: { Authorization: `Bearer ${tok}` },
+})).json();
+const examQ = await (await realFetch(`${API}/api/v1/courses/soc-n1/exams/fase-1-examen`, {
+  headers: { Authorization: `Bearer ${tok}` },
+})).json();
+const dupResp = examQ.questions.map(q => ({ exercise_id: q.id, answer: null }));
+dupResp.push({ exercise_id: dupResp[0].exercise_id, answer: null });
+const r422 = await realFetch(`${API}/api/v1/courses/soc-n1/exams/fase-1-examen/attempts`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json", Authorization: `Bearer ${tok}` },
+  body: JSON.stringify({ session_id: sess.session_id, responses: dupResp }),
+});
+check("Iter2: ids duplicados -> rechazo controlado 422", r422.status === 422);
+
 await renderHistorial(root);
 check("Auth: historial lista intentos", root.querySelectorAll(".hist-table tbody tr").length >= 2);
 

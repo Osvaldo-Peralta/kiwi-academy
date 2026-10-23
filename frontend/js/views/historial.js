@@ -44,8 +44,9 @@ export async function renderHistorial(root) {
     const scope = a.scope || {};
     const isExam = scope.type === "exam";
     const pct = a.score?.percent ?? 0;
-    const badgeCls = isExam
-      ? (a.score?.passed ? "green" : "red")
+    const pendingReview = isExam && a.score?.status === "pending_review";
+    const badgeCls = pendingReview ? "warn"
+      : isExam ? (a.score?.passed ? "green" : "red")
       : (a.score?.passed ? "green" : pct > 0 ? "warn" : "dim");
 
     const row = el("tr", {},
@@ -55,9 +56,10 @@ export async function renderHistorial(root) {
         scope.exercise_id ? el("span", { class: "mono", style: "color:var(--text-faint)" }, ` · ${scope.exercise_id}`) : null,
       ),
       el("td", {}, el("span", { class: `badge ${badgeCls}` },
-        isExam ? (a.score?.passed ? "aprobado" : "no aprobado")
-          : (a.score?.passed ? "correcto" : a.score?.pending ? "revisión" : pct > 0 ? "parcial" : "incorrecto"))),
-      el("td", {}, el("span", { class: "mono" }, `${pct}% (${a.score?.points_earned ?? 0}/${a.score?.points_total ?? 0})`)),
+        pendingReview ? "revisión pendiente"
+        : isExam ? (a.score?.passed ? "aprobado" : "no aprobado")
+        : (a.score?.passed ? "correcto" : a.score?.pending ? "revisión" : pct > 0 ? "parcial" : "incorrecto"))),
+      el("td", {}, el("span", { class: "mono" }, pendingReview ? `${pct}% prov.` : `${pct}% (${a.score?.points_earned ?? 0}/${a.score?.points_total ?? 0})`)),
       el("td", {}, el("span", { class: "mono" }, fmtDate(a.submitted_at))),
       el("td", {}, isExam && scope.course_id
         ? el("button", { class: "btn ghost sm", onclick: () => openReport(scope.course_id, a.id) }, "📄 reporte")

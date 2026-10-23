@@ -226,7 +226,7 @@ function buildMatching(area, ex, state, opts) {
 // ---------------------------------------------------------------- free_text
 function buildFreeText(area, ex, state, opts) {
   state.answer = "";
-  const ta = el("textarea", { class: "txt", placeholder: "Escribe tu análisis aquí… (se incluirá en tu reporte exportable para revisión)" });
+  const ta = el("textarea", { class: "txt", placeholder: "Escribe tu análisis aquí… En exámenes lo puntúa un revisor humano (la cobertura de palabras clave es solo orientativa y no suma puntos automáticos)." });
   const counter = el("span", { style: "font-size:11px;color:var(--text-faint);font-family:var(--mono)" }, "0 caracteres");
   ta.addEventListener("input", () => {
     state.answer = ta.value;

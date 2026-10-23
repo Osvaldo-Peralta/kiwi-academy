@@ -135,7 +135,9 @@ function moduleBlock(mod, dashMod, courseId, hasSession) {
               : `${mod.exam.question_count} preguntas · aprobación: ${mod.exam.pass_score}%${mod.exam.time_limit_minutes ? ` · ${mod.exam.time_limit_minutes} min` : ""}`),
         ),
         el("div", { class: "right" },
-          dashExam ? (passed ? el("span", { class: "badge green" }, "✓ aprobado") : el("span", { class: "badge warn" }, "pendiente")) : null,
+          dashExam ? (passed ? el("span", { class: "badge green" }, "✓ aprobado")
+            : dashExam.last_status === "pending_review" ? el("span", { class: "badge warn" }, "⏳ último: revisión pendiente")
+            : el("span", { class: "badge warn" }, "pendiente")) : null,
           hasSession
             ? el("a", { class: "btn sm primary", href: `#/curso/${courseId}/examen/${mod.exam.id}` }, passed ? "Repetir" : "Presentar")
             : el("a", { class: "btn sm ghost", href: "#/auth" }, "Inicia sesión"),
