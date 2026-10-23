@@ -3,3 +3,7 @@ uvicorn[standard]>=0.30
 pydantic>=2.7
 pyyaml>=6.0
 python-dotenv>=1.0
+# Iteración 1: verificación estricta de JWT de Supabase Auth (HS256 + JWKS
+# ES256/RS256). PyJWT es el estándar de facto (MIT); el extra [crypto] trae
+# cryptography (Apache-2.0/BSD-3) para algoritmos asimétricos.
+PyJWT[crypto]>=2.8

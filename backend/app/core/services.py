@@ -59,18 +59,71 @@ class LearningService:
     # Lecciones
     # ------------------------------------------------------------------
 
-    def get_lesson_public(self, user_id: str, course_id: str, module_id: str, lesson_id: str) -> dict[str, Any]:
+    def get_lesson_public(
+        self, user_id: Optional[str], course_id: str, module_id: str, lesson_id: str,
+    ) -> dict[str, Any]:
         lesson = self.content.get_lesson(course_id, module_id, lesson_id)
+        # AUTH-04: las lecciones no publicadas no se sirven a nadie (404).
+        # Su metadata (título/estado) sigue visible en el catálogo del curso.
+        if lesson.status != "published":
+            raise NotFoundError(
+                f"Lección no encontrada: {course_id}/{module_id}/{lesson_id}"
+            )
         data = lesson.public()
-        prog = self.progress.get_progress(user_id)
-        data["progress"] = prog.get("lessons", {}).get(
-            lesson_key(course_id, module_id, lesson_id),
-            {"status": "not_started", "exercises_mastered": 0,
-             "exercises_reviewed": 0, "exercises_done": 0,
-             "exercises_total": len(lesson.exercises)},
-        )
+        if user_id:
+            prog = self.progress.get_progress(user_id)
+            data["progress"] = prog.get("lessons", {}).get(
+                lesson_key(course_id, module_id, lesson_id),
+                {"status": "not_started", "exercises_mastered": 0,
+                 "exercises_reviewed": 0, "exercises_done": 0,
+                 "exercises_total": len(lesson.exercises)},
+            )
+        else:
+            # invitado sin sesión: progreso en ceros (modo lectura)
+            data["progress"] = {
+                "status": "not_started", "exercises_mastered": 0,
+                "exercises_reviewed": 0, "exercises_done": 0,
+                "exercises_total": len(lesson.exercises),
+            }
         data["exercise_count"] = len(lesson.exercises)
         return data
+
+    def course_catalog(self, course_id: str) -> dict[str, Any]:
+        """Catálogo público (invitados): metadata de módulos/lecciones/examen."""
+        course = self.content.get_course(course_id)
+        modules_out = []
+        for mod in self.content.list_modules(course_id):
+            lessons_out = []
+            for lid in mod.lessons:
+                lesson = self.content.get_lesson(course_id, mod.id, lid)
+                lessons_out.append({
+                    "id": lid,
+                    "title": lesson.title,
+                    "kind": lesson.kind,
+                    "status": lesson.status,
+                    "summary": lesson.summary,
+                    "estimated_minutes": lesson.estimated_minutes,
+                    "exercise_count": len(lesson.exercises),
+                })
+            exam_out = None
+            if mod.exam:
+                try:
+                    exam = self.content.get_exam(course_id, mod.exam)
+                    exam_out = {
+                        "id": exam.id, "title": exam.title,
+                        "pass_score": exam.pass_score,
+                        "time_limit_minutes": exam.time_limit_minutes,
+                        "question_count": len(exam.questions),
+                    }
+                except NotFoundError:
+                    exam_out = None
+            modules_out.append({
+                "id": mod.id, "title": mod.title, "phase": mod.phase,
+                "subtitle": mod.subtitle, "duration": mod.duration,
+                "outcome": mod.outcome, "lessons": lessons_out, "exam": exam_out,
+                "resources": [r.model_dump(exclude_none=True) for r in mod.resources],
+            })
+        return {"course": course.model_dump(), "modules": modules_out}
 
     def mark_lesson_progress(
         self,

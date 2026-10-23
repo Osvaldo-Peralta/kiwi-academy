@@ -37,6 +37,21 @@ class ExamStateError(AppError):
     code = "exam_state_error"
 
 
+class AuthError(AppError):
+    """Credenciales ausentes/inválidas/expiradas. El subcódigo viaja en
+    `details['reason']`: missing | malformed | invalid | expired |
+    invalid_subject | invalid_subject_namespace | not_available."""
+    status_code = 401
+    code = "auth_error"
+
+
+class AuthNotConfiguredError(AppError):
+    """El servidor exige auth (modo supabase) pero no tiene credenciales de
+    verificación configuradas. Fail-closed: 503, nunca identidad implícita."""
+    status_code = 503
+    code = "auth_not_configured"
+
+
 def register_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(AppError)
     async def _app_error_handler(request: Request, exc: AppError):  # noqa: ARG001

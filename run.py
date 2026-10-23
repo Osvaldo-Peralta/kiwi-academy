@@ -5,6 +5,9 @@ Robusto a propósito:
 - Funciona desde cualquier directorio de trabajo.
 - Preflight con diagnósticos claros (versión de Python, dependencias, puerto).
 - Mensajes de error accionables en español.
+- Desarrollo local: KIWI_AUTH_MODE=local por defecto SOLO aquí (run.py es el
+  lanzador de desarrollo). En producción (Docker/Vercel/uvicorn directo) el
+  default de la aplicación sigue siendo "supabase".
 """
 import os
 import socket
@@ -12,6 +15,11 @@ import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+
+# Default de DESARROLLO LOCAL: modo local (emisor dev de JWT). La app en sí
+# tiene como default "supabase"; esto solo aplica al lanzador de desarrollo.
+os.environ.setdefault("KIWI_AUTH_MODE", "local")
+
 HOST = os.environ.get("KIWI_HOST", "127.0.0.1")
 PORT = int(os.environ.get("KIWI_PORT", "8000"))
 
@@ -73,9 +81,16 @@ def preflight() -> None:
     sys.path.insert(0, str(PROJECT_ROOT))
     try:
         from backend.app.main import app  # noqa: F401
+        from backend.app.config import settings as _s
     except Exception as exc:
         sys.exit(f"{FAIL} La aplicación falló al importar:\n   {type(exc).__name__}: {exc}")
     print(f"{OK} Aplicación FastAPI lista")
+    mode = _s.AUTH_MODE
+    if mode in ("local", "test"):
+        print(f"{OK} KIWI_AUTH_MODE={mode} (desarrollo — emisor dev de JWT; "
+              f"en producción el default es 'supabase')")
+    else:
+        print(f"{OK} KIWI_AUTH_MODE={mode} (requiere SUPABASE_URL y secreto/JWKS)")
 
 
 def main() -> None:

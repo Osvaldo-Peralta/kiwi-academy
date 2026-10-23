@@ -1,9 +1,13 @@
-"""Endpoints de exámenes: entrega, envío y reportes."""
+"""Endpoints de exámenes: entrega, envío y reportes.
+
+Iteración 1 (auth): GET del examen sigue siendo contenido público (preguntas
+sin respuestas); el envío y los reportes exigen identidad autenticada.
+"""
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Query
 
-from .deps import get_service, get_user_id
+from .deps import get_current_user, get_service
 from ...core.models import ExamSubmission
 from ...core.services import LearningService
 
@@ -23,7 +27,7 @@ def get_exam(
 def submit_exam(
     course_id: str, exam_id: str,
     payload: ExamSubmission,
-    user_id: str = Depends(get_user_id),
+    user_id: str = Depends(get_current_user),
     service: LearningService = Depends(get_service),
 ):
     """Califica el examen completo, genera feedback y reporte exportable."""
@@ -39,7 +43,7 @@ def submit_exam(
 def attempt_report(
     course_id: str, attempt_id: str,
     fmt: str = Query(default="markdown", alias="format", pattern="^(markdown|json)$"),
-    user_id: str = Depends(get_user_id),
+    user_id: str = Depends(get_current_user),
     service: LearningService = Depends(get_service),
 ):
     """Reporte del intento (markdown para pegar a tu IA/mentor, o json)."""
