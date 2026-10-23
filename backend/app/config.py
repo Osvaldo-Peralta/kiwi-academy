@@ -65,8 +65,25 @@ class Settings:
     # Frontend estático
     FRONTEND_DIR: Path = _env_path("KIWI_FRONTEND_DIR", PROJECT_ROOT / "frontend")
 
-    # Usuario por defecto cuando no llega cabecera X-User-Id (uso local)
-    DEFAULT_USER_ID: str = os.environ.get("KIWI_DEFAULT_USER", "default")
+    # Usuario por defecto: ELIMINADO en Iteración 1. La identidad deriva
+    # exclusivamente del JWT verificado (claim sub). No existe usuario
+    # implícito ni cabecera de identidad aceptada.
+
+    # ── Autenticación (Iteración 1) ─────────────────────────────────────
+    # Modo de auth: supabase (DEFAULT/producción) | local (desarrollo) | test
+    AUTH_MODE: str = os.environ.get("KIWI_AUTH_MODE", "supabase").strip().lower()
+
+    # Supabase (modo supabase)
+    SUPABASE_URL: str = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
+    # Secreto JWT legacy HS256 (SECRETO: nunca exponer al frontend ni loguear)
+    SUPABASE_JWT_SECRET: str = os.environ.get("SUPABASE_JWT_SECRET", "")
+    # Anon key: pública por diseño (cliente navegador). Se sirve vía /api/v1/config
+    SUPABASE_ANON_KEY: str = os.environ.get("SUPABASE_ANON_KEY", "")
+    # Verificación supabase: auto | secret (HS256) | jwks (ES256/RS256)
+    JWT_MODE: str = os.environ.get("KIWI_JWT_MODE", "auto").strip().lower()
+
+    # Desarrollo local (modo local): secreto del emisor dev; si falta, efímero
+    DEV_JWT_SECRET: str = os.environ.get("KIWI_DEV_JWT_SECRET", "")
 
     # Persistencia SQL opcional (Supabase/Postgres o SQLite). Vacío = archivos JSON.
     #   postgresql://user:pass@host:port/db   (Supabase: Settings -> Database -> URI)
@@ -90,3 +107,15 @@ class Settings:
 
 
 settings = Settings()
+
+# Validación fail-fast de la configuración de auth: mejor un error claro al
+# arrancar que un comportamiento indefinido en runtime.
+if settings.AUTH_MODE not in ("supabase", "local", "test"):
+    raise ValueError(
+        f"KIWI_AUTH_MODE inválido: {settings.AUTH_MODE!r} "
+        "(valores admitidos: supabase | local | test; default: supabase)"
+    )
+if settings.JWT_MODE not in ("auto", "secret", "jwks"):
+    raise ValueError(
+        f"KIWI_JWT_MODE inválido: {settings.JWT_MODE!r} (auto | secret | jwks)"
+    )

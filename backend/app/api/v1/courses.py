@@ -48,3 +48,14 @@ def get_course(course_id: str, service: LearningService = Depends(get_service)):
         for m in service.content.list_modules(course_id)
     ]
     return {"course": course.model_dump(), "modules": modules}
+
+
+@router.get("/{course_id}/catalog")
+def get_catalog(course_id: str, service: LearningService = Depends(get_service)):
+    """Catálogo PÚBLICO del curso: metadata de módulos/lecciones/exámenes.
+
+    Pensado para invitados (modo lectura sin sesión): títulos, tipos, estado
+    (published/draft), duraciones y conteo de ejercicios. NO incluye contenido
+    de lecciones, preguntas de examen ni datos de usuario.
+    """
+    return service.course_catalog(course_id)

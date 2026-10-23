@@ -1,5 +1,8 @@
 // Vista: lección (teoría + ejemplos + ejercicios con feedback inmediato)
+// Iteración 1: teoría/ejemplos son públicos; marcar progreso y evaluar
+// ejercicios requieren sesión (identidad JWT verificada por el backend).
 import { api } from "../api.js";
+import { getCurrentUser } from "../auth.js";
 import { el, escapeHtml, toast, KIND_BADGE, KIND_LABEL } from "../util.js";
 import { renderMarkdown, contentBlockHtml } from "../markdown.js";
 import { createExerciseWidget } from "../components/exercises.js";
@@ -13,6 +16,7 @@ export async function renderLesson(root, courseId, moduleId, lessonId) {
     root.appendChild(el("div", { class: "empty-state" }, el("div", { class: "big" }, "🚫"), e.message));
     return;
   }
+  const user = await getCurrentUser();
 
   const prog = lesson.progress || {};
   const total = lesson.exercise_count || 0;
@@ -137,16 +141,25 @@ export async function renderLesson(root, courseId, moduleId, lessonId) {
     });
     contentEl.appendChild(
       el("div", { style: "margin-top:22px;display:flex;gap:12px;align-items:center;flex-wrap:wrap" },
-        el("button", {
+        user ? el("button", {
           class: "btn primary", disabled: prog.theory_completed,
           onclick: async (ev) => {
-            ev.target.disabled = true;
-            prog.theory_completed = true;
-            await api.markLessonProgress(courseId, moduleId, lessonId, { theory_completed: true });
-            toast("Teoría marcada como leída ✓");
-            refreshMastery();
+            const btn = ev.target;
+            btn.disabled = true;
+            try {
+              await api.markLessonProgress(courseId, moduleId, lessonId, { theory_completed: true });
+              prog.theory_completed = true;
+              toast("Teoría marcada como leída ✓");
+              btn.textContent = "✓ Teoría completada";
+              refreshMastery();
+            } catch (e) {
+              // UX-02: si la petición falla, el estado NO se marca como leído
+              btn.disabled = false;
+              toast(`No se pudo guardar: ${e.message}`, "err");
+            }
           },
-        }, prog.theory_completed ? "✓ Teoría completada" : "Marcar teoría como leída"),
+        }, prog.theory_completed ? "✓ Teoría completada" : "Marcar teoría como leída")
+        : el("a", { class: "btn ghost", href: "#/auth" }, "🔒 Inicia sesión para marcar la teoría"),
         el("button", { class: "btn ghost", onclick: () => setTab("ejemplos") }, "Ver ejemplos →"),
       ),
     );
@@ -169,15 +182,24 @@ export async function renderLesson(root, courseId, moduleId, lessonId) {
     });
     contentEl.appendChild(
       el("div", { style: "margin-top:22px;display:flex;gap:12px" },
-        el("button", {
+        user ? el("button", {
           class: "btn primary", disabled: prog.examples_viewed,
           onclick: async (ev) => {
-            ev.target.disabled = true;
-            prog.examples_viewed = true;
-            await api.markLessonProgress(courseId, moduleId, lessonId, { examples_viewed: true });
-            toast("Ejemplos marcados como vistos ✓");
+            const btn = ev.target;
+            btn.disabled = true;
+            try {
+              await api.markLessonProgress(courseId, moduleId, lessonId, { examples_viewed: true });
+              prog.examples_viewed = true;
+              toast("Ejemplos marcados como vistos ✓");
+              btn.textContent = "✓ Ejemplos vistos";
+            } catch (e) {
+              // UX-02: revertir estado optimista si la petición falla
+              btn.disabled = false;
+              toast(`No se pudo guardar: ${e.message}`, "err");
+            }
           },
-        }, prog.examples_viewed ? "✓ Ejemplos vistos" : "Marcar ejemplos como vistos"),
+        }, prog.examples_viewed ? "✓ Ejemplos vistos" : "Marcar ejemplos como vistos")
+        : el("a", { class: "btn ghost", href: "#/auth" }, "🔒 Inicia sesión para marcar ejemplos"),
         el("button", { class: "btn ghost", onclick: () => setTab("ejercicios") }, "Ir a los ejercicios →"),
       ),
     );
@@ -189,6 +211,15 @@ export async function renderLesson(root, courseId, moduleId, lessonId) {
       contentEl.appendChild(el("p", { style: "color:var(--text-dim)" }, "Sin ejercicios todavía."));
       return;
     }
+    if (!user) {
+      contentEl.appendChild(
+        el("div", { class: "guest-banner" },
+          el("span", {}, "🔒 Los ejercicios se evalúan y guardan solo con sesión activa. "),
+          el("a", { href: "#/auth" }, "Inicia sesión o continúa como invitado"),
+          el("span", {}, " para practicar. Puedes leer la teoría y los ejemplos sin cuenta."),
+        ),
+      );
+    }
     contentEl.appendChild(el("p", { style: "color:var(--text-dim);font-size:13.5px;margin-bottom:14px" },
       "Modo práctica: comprueba cada ejercicio y recibe feedback inmediato. Puedes reintentar tantas veces como quieras — un ejercicio cuenta como dominado cuando lo aciertas."));
 
@@ -199,7 +230,11 @@ export async function renderLesson(root, courseId, moduleId, lessonId) {
       if (doneSet.has(ex.id)) widget.setSolved(true);
 
       const actions = el("div", { class: "ex-actions" });
-      const checkBtn = el("button", { class: "btn primary sm", onclick: () => check() }, "Comprobar");
+      const checkBtn = el("button", {
+        class: "btn primary sm", disabled: !user,
+        onclick: () => check(),
+      }, user ? "Comprobar" : "🔒 Inicia sesión");
+      if (!user) checkBtn.addEventListener("click", () => { location.hash = "#/auth"; });
       const retryBtn = el("button", { class: "btn ghost sm", style: "display:none", onclick: () => { widget.reset(); retryBtn.style.display = "none"; checkBtn.disabled = false; } }, "↺ Reintentar");
       actions.append(checkBtn, retryBtn,
         el("span", { class: "spacer" }),

@@ -1,9 +1,23 @@
-// Vista: historial completo de intentos
+// Vista: historial completo de intentos (requiere sesión)
 import { api } from "../api.js";
+import { getCurrentUser } from "../auth.js";
 import { el, fmtDate, toast } from "../util.js";
 
 export async function renderHistorial(root) {
   root.innerHTML = "";
+  const user = await getCurrentUser();
+  if (!user) {
+    root.appendChild(
+      el("div", { class: "empty-state" },
+        el("div", { class: "big" }, "🔒"),
+        el("h2", {}, "El historial es personal"),
+        el("p", { style: "margin:8px 0 16px;color:var(--text-dim)" },
+          "Inicia sesión para ver tus evaluaciones e informes."),
+        el("a", { class: "btn primary", href: "#/auth" }, "Iniciar sesión"),
+      ),
+    );
+    return;
+  }
   root.appendChild(
     el("div", { class: "page-head" },
       el("h1", {}, "🕘 Historial de evaluaciones"),

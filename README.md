@@ -23,8 +23,15 @@ python run.py
 
 Abre **http://localhost:8000** — listo. 🎉
 
+`run.py` arranca en **modo desarrollo** (`KIWI_AUTH_MODE=local`): la pantalla
+de sesión te pedirá un usuario `dev-*` y el backend emitirá un JWT de
+desarrollo. **La verificación del token es la misma que en producción**; solo
+cambia el emisor. En producción el modo por defecto es `supabase` (identidad
+emitida por Supabase Auth, verificada en el backend con HS256 o JWKS).
+
 - Documentación interactiva de la API: http://localhost:8000/api/docs
-- Tu progreso se guarda en `data/users/default/` (archivos JSON, inspeccionables)
+- Tu progreso se guarda bajo tu identidad JWT en `data/users/<sub>/` (modo archivos) o en SQL (`KIWI_DATABASE_URL`)
+- La cabecera `X-User-Id` **ya no existe**: la identidad proviene solo del JWT verificado
 - `run.py` hace un **preflight con diagnósticos**: si algo falla (Python viejo,
   dependencias, puerto ocupado) te dice exactamente qué y cómo arreglarlo
 
@@ -32,22 +39,25 @@ Abre **http://localhost:8000** — listo. 🎉
 
 | Síntoma | Causa típica | Solución |
 |---------|--------------|----------|
-| `ModuleNotFoundError: fastapi` (o yaml/uvicorn) | Dependencias no instaladas (o venv sin activar) | `pip install -r requirements.txt` |
+| `ModuleNotFoundError: fastapi` (o yaml/uvicorn/jwt) | Dependencias no instaladas (o venv sin activar) | `pip install -r requirements.txt` |
 | `TypeError: unsupported operand type(s) for \|` al arrancar | Python 3.8 o menor | Instala Python 3.9+ (recomendado 3.11+) |
 | `address already in use` | Otra instancia corriendo en el puerto 8000 | `KIWI_PORT=8001 python run.py` (Windows: `set KIWI_PORT=8001`) |
 | La página carga pero dice "No se pudo contactar la API" | Abriste `index.html` directo (file://) en vez de pasar por el server | Entra siempre por `http://localhost:8000` |
+| La API responde `503 auth_not_configured` | Modo `supabase` sin `SUPABASE_URL`/secreto configurados (fail-closed a propósito) | Configura Supabase (`.env`) o usa `python run.py` (modo local) |
+| `401` al entrar con usuario sin prefijo `dev-` en local | El emisor dev exige el namespace `dev-*` | Usa p. ej. `dev-osvaldo` |
 | `Error: contenido inválido` al cargar un curso | YAML de contenido mal editado | El mensaje incluye archivo y línea; revisa tu última edición |
 | Puerto ocupado en Windows sin saber por qué | — | `netstat -ano \| findstr :8000` → `taskkill /PID <pid> /F` |
 
 ### Tests
 
 ```bash
-# Backend (motor de evaluación + API + store SQL): 35 tests
+# Backend (evaluación + API + auth/JWT + store SQL): 67 tests
 pip install -r requirements-dev.txt
 python -m pytest backend/tests/ -q
 
-# Frontend (requiere el server corriendo + npm install)
+# Frontend (28 verificaciones; requiere el server en modo test + npm install)
 npm install
+KIWI_AUTH_MODE=test uvicorn backend.app.main:app --host 127.0.0.1 --port 8000 &
 node tests/frontend_smoke.mjs
 ```
 
@@ -123,7 +133,7 @@ feedback ya redactado.
 | Más cursos (SOC N2, etc.) | Un curso = una carpeta YAML en `content/courses/`. La API los descubre sola |
 | Más tipos de ejercicio | Escribir 1 función grader + registrarla en `GRADERS` (10 líneas) |
 | Base de datos real | ✅ **Ya disponible**: `KIWI_DATABASE_URL=postgresql://...` (Supabase) o `sqlite:///...` — mismo contrato `ProgressStore`, cero cambios en servicios/API |
-| Multiusuario / 1000+ estudiantes | `X-User-Id` ya aísla datos por usuario; se sustituye por auth JWT en `deps.py` |
+| Multiusuario / 1000+ estudiantes | ✅ **Iteración 1:** identidad por JWT verificado (Supabase Auth); `X-User-Id` eliminado; datos aislados por `sub` con tests negativos de suplantación |
 | Frontend React/móvil | La API REST v1 es el contrato; el frontend actual es reemplazable sin tocar backend |
 | Despliegue | Backend: Render/Railway/Fly (uvicorn) o Vercel (serverless). Frontend: Vercel/Netlify estático. `DATA_DIR`/`CONTENT_DIR` via env vars |
 | Auditoría/analytics | Intentos append-only en un archivo por intento → migrables a tabla/CSV tal cual |
@@ -162,16 +172,17 @@ kiwi-academy/
 │   ├── app/
 │   │   ├── main.py            # FastAPI app factory + static mount
 │   │   ├── config.py          # rutas/env (KIWI_*) + fallback /tmp serverless
-│   │   ├── api/v1/            # cursos, lecciones, exámenes, progreso
-│   │   ├── core/              # models, services, evaluation, feedback, errors
-│   │   └── storage/           # base (puertos) + json_store (adaptador)
-│   └── tests/                 # 35 tests: evaluación + API + anti-fugas + SQL store
+│   │   ├── api/v1/            # auth/config, cursos, lecciones, exámenes, progreso
+│   │   ├── core/              # auth (JWT), models, services, evaluation, feedback, errors
+│   │   └── storage/           # base (puertos) + json_store + sql_store + factory
+│   └── tests/                 # 67 tests: evaluación + API + auth/JWT + anti-fugas + SQL
 ├── content/courses/soc-n1/    # CONTENIDO (YAML versionado)
 │   ├── course.yaml
 │   ├── modules/<id>/{module.yaml, lessons/<id>.yaml}
 │   └── exams/<id>.yaml
 ├── data/users/<user>/         # DATOS (progreso.json, attempts/, reports/)
 ├── frontend/                  # SPA sin build (index.html, css/, js/)
+│   └── js/vendor/             # supabase-js vendorizado + PROVENANCE.md
 ├── tests/frontend_smoke.mjs   # smoke test jsdom de todas las vistas
 ├── tools/                     # generadores de contenido
 └── docs/                      # arquitectura + contenido + despliegue
