@@ -166,14 +166,56 @@ export async function devSignIn(userId) {
   return data;
 }
 
+// ── Recuperación segura de sesión persistida (H-01, revisión 2) ──────────
+// Basada en el código REAL del bundle vendorizado (supabase-js 2.118.0):
+//  - storageKey por defecto: `sb-<ref>-auth-token` (ref = primer segmento del
+//    hostname de la URL del proyecto; visto en el constructor del cliente).
+//  - getSession() -> _useSession() -> __loadSession() -> storage.getItem():
+//    la sesión se lee del storage EN CADA llamada (no hay caché en memoria
+//    del cliente que sobreviva al borrado).
+//  - _removeSession() borra storageKey, storageKey+"-user" y derivados
+//    (p. ej. "-code-verifier").
+//  - _signOut() puede devolver {error} SIN haber eliminado la sesión
+//    (early-return cuando getSession falla) y, aun con scope:"local", hace
+//    POST /logout?scope=local si hay access_token (errores de red -> devuelve
+//    {error} aunque en esa ruta sí llama a _removeSession).
+// Por tanto: si signOut no confirma éxito (error devuelto o excepción), se
+// purgan todas las claves localStorage con el prefijo del storageKey. Tras la
+// purga, getSession() devuelve sesión nula de forma determinista (lee del
+// storage), dejando la UI en estado seguro sin reintentos ni bucles.
+function purgePersistedSupabaseSession() {
+  let prefix = null;
+  try {
+    const url = cfg?.supabase?.url;
+    if (url) {
+      const ref = new URL(url).hostname.split(".")[0];
+      if (ref) prefix = `sb-${ref}-auth-token`;
+    }
+  } catch { /* URL inválida: se usa el patrón genérico */ }
+  const removed = [];
+  try {
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const k = localStorage.key(i);
+      if (!k) continue;
+      const hit = prefix
+        ? k.startsWith(prefix)
+        : (k.startsWith("sb-") && k.includes("-auth-token"));
+      if (hit) {
+        localStorage.removeItem(k);
+        removed.push(k);
+      }
+    }
+  } catch { /* almacenamiento no disponible: no hay nada que purgar */ }
+  return removed;
+}
+
 // Limpieza de sesión cuando el backend rechaza nuestro token (inválido/
 // expirado/irrecuperable). H-01: cubre AMBOS modos —
 //   local/test: olvida el token dev (memoria + localStorage)
-//   supabase:   fuerza el cierre LOCAL de la sesión en supabase-js
-//               (scope "local": el token ya es inválido, no tiene sentido
-//               intentar revocarlo en el servidor) — sin esto, getSession()
-//               seguiría devolviendo la sesión muerta y la interfaz la
-//               mostraría como activa.
+//   supabase:   signOut({scope:"local"}) verificando el RESULTADO (la librería
+//               puede devolver {error} sin lanzar excepción); si la limpieza
+//               no queda confirmada, purga el storage persistido (ver arriba).
+//               Nunca se notifica "sesión limpia" sin confirmación o purga.
 // Al final notifica a los suscriptores (chip de sesión, router) para que la
 // UI refleje inmediatamente el estado real.
 export async function clearInvalidSession() {
@@ -182,11 +224,27 @@ export async function clearInvalidSession() {
   localStorage.removeItem(DEV_TOKEN_KEY);
   localStorage.removeItem(DEV_USER_KEY);
   if (sbClient) {
+    let confirmed = false;
     try {
-      await sbClient.auth.signOut({ scope: "local" });
+      const res = await sbClient.auth.signOut({ scope: "local" });
+      // Contrato vendorizado (2.118.0): signOut devuelve {error|null} y solo
+      // a veces lanza. Éxito confirmado == objeto devuelto sin .error.
+      confirmed = !!res && !res.error;
+      if (!confirmed) {
+        // Solo el nombre/tipo del error: nunca el objeto completo (podría
+        // contener datos de sesión). Sin secretos ni PII en logs.
+        console.warn(
+          "auth: signOut(local) devolvió error; purgando sesión persistida.",
+          res?.error?.name || "(sin nombre)",
+        );
+      }
     } catch (e) {
-      console.warn("clearInvalidSession: signOut local falló", e);
+      console.warn(
+        "auth: signOut(local) lanzó excepción; purgando sesión persistida.",
+        e?.name || "Error",
+      );
     }
+    if (!confirmed) purgePersistedSupabaseSession();
   }
   notifyAuthChange();
 }
@@ -195,4 +253,10 @@ export async function clearInvalidSession() {
 // permitiendo simular una sesión corrupta sin tocar la lógica de producción.
 export function _setDevTokenForTests(tok) {
   devToken = tok;
+}
+
+// Hook exclusivo para las pruebas smoke: inyecta/restaura el cliente
+// supabase (permite simular resultados exitosos y fallidos de signOut).
+export function _setSbClientForTests(client) {
+  sbClient = client;
 }

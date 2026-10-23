@@ -174,33 +174,92 @@ check("C1: sesión dev limpiada (localStorage)", dom.window.localStorage.getItem
 check("C1: redirigido a #/auth", dom.window.location.hash === "#/auth");
 check("C1: getCurrentUser ya no muestra sesión activa", (await auth.getCurrentUser()) === null);
 
-// C2 — modo supabase (cliente simulado): sesión muerta -> signOut local + UI coherente
-let signOutCalls = [];
-let fakeSession = { access_token: "sb-token-muerto", user: { id: "u-fake-1", email: "persona@example.com", is_anonymous: false } };
-const fakeSbClient = {
-  auth: {
-    getSession: async () => ({ data: { session: fakeSession } }),
-    signOut: async (opts) => { signOutCalls.push(opts || {}); fakeSession = null; },
-    onAuthStateChange: () => ({ data: { subscription: { unsubscribe() {} } } }),
-  },
-};
-dom.window.supabase = { createClient: () => fakeSbClient };
+// ------------------------------------------------------------------ FASE C2: H-01 rev2 — modo supabase, resultados de signOut
+// Mocks que modelan el contrato REAL verificado en el bundle vendorizado
+// (supabase-js 2.118.0):
+//   - getSession() lee del storage en cada llamada (clave sb-<ref>-auth-token)
+//   - signOut({scope:"local"}) puede: (1) devolver {error:null} tras borrar,
+//     (2) devolver {error} SIN borrar (early-return por getSession fallido),
+//     (3) lanzar excepción (errores no-Auth propagados por admin.signOut).
+const SB_KEY = "sb-fakeref-auth-token";           // ref = "fakeref" (hostname)
+const SB_KEY_DERIVADA = "sb-fakeref-auth-token-user";
 configOverride = { auth_mode: "supabase", supabase: { url: "https://fakeref.supabase.co", anon_key: "anon-publica" } };
 await auth.loadAuthConfig(true);
-const guest = await auth.getCurrentUser();
-check("C2: sesión supabase se muestra activa antes del fallo", guest?.label === "persona@example.com");
+const apiMod = (await import(`${JS}/api.js`)).api;
 
-let c2Error = null;
-try {
-  const { api } = await import(`${JS}/api.js`);
-  await api.dashboard();   // el server (modo test) rechazará "sb-token-muerto" -> 401
-} catch (e) { c2Error = e; }
-check("C2: backend rechaza el token supabase inválido (401)", c2Error?.status === 401);
-check("C2: clearInvalidSession hizo signOut scope=local", signOutCalls.length === 1 && signOutCalls[0].scope === "local");
-check("C2: getCurrentUser ya no muestra la sesión muerta", (await auth.getCurrentUser()) === null);
+function installMockSession() {
+  dom.window.localStorage.setItem(SB_KEY, JSON.stringify({
+    access_token: "sb-token-muerto", refresh_token: "rt-muerto",
+    user: { id: "u-fake-1", email: "persona@example.com", is_anonymous: false },
+  }));
+  dom.window.localStorage.setItem(SB_KEY_DERIVADA, JSON.stringify({ id: "u-fake-1" }));
+}
+function mockClient(signOutImpl) {
+  return {
+    auth: {
+      // modelo fiel del vendor: getSession lee del storage en cada llamada
+      getSession: async () => ({ data: { session: JSON.parse(dom.window.localStorage.getItem(SB_KEY) || "null") } }),
+      signOut: signOutImpl,
+      onAuthStateChange: () => ({ data: { subscription: { unsubscribe() {} } } }),
+    },
+  };
+}
 
+let hashChangeCount = 0;
+dom.window.addEventListener("hashchange", () => hashChangeCount++);
+let notifyCount = 0;
+auth.onAuthChange(() => notifyCount++);
+
+// ── Escenario 1: signOut devuelve { error: null } -> limpieza confirmada + notificación
+installMockSession();
+let signOutCalls = [];
+let hashAtSignOut = null;
+auth._setSbClientForTests(mockClient(async (opts) => {
+  signOutCalls.push(opts || {});
+  hashAtSignOut = dom.window.location.hash;         // evidencia de orden: limpieza ANTES de navegar
+  dom.window.localStorage.removeItem(SB_KEY);       // modela _removeSession (éxito)
+  dom.window.localStorage.removeItem(SB_KEY_DERIVADA);
+  return { error: null };
+}));
+dom.window.location.hash = "#/";
+await sleep(80);
+check("C2a: sesión supabase activa antes del fallo", (await auth.getCurrentUser())?.label === "persona@example.com");
+const hashBase1 = hashChangeCount;
+let c2aErr = null;
+try { await apiMod.dashboard(); } catch (e) { c2aErr = e; }   // server (modo test) rechaza "sb-token-muerto" -> 401
+await sleep(80);
+check("C2a: backend responde 401 al token supabase inválido", c2aErr?.status === 401);
+check("C2a: signOut invocado con scope=local", signOutCalls.length === 1 && signOutCalls[0].scope === "local");
+check("C2a: limpieza ocurrió ANTES de la navegación (hash aún no era #/auth)", hashAtSignOut === "#/");
+check("C2a: sesión limpiada y cambio notificado", (await auth.getCurrentUser()) === null && notifyCount >= 1);
+check("C2a: una única redirección a #/auth", dom.window.location.hash === "#/auth" && hashChangeCount - hashBase1 === 1);
+
+// ── Escenario 2: signOut devuelve { error } SIN borrar -> fallo detectado + purga de recuperación
+installMockSession();
+auth._setSbClientForTests(mockClient(async () => ({ error: { name: "AuthUnknownError", message: "estado de sesión corrupto" } })));
+check("C2b: sesión persistida de nuevo activa", (await auth.getCurrentUser())?.label === "persona@example.com");
+let c2bErr = null;
+try { await apiMod.dashboard(); } catch (e) { c2bErr = e; }
+await sleep(80);
+check("C2b: 401 y signOut devolvió error (sin excepción)", c2bErr?.status === 401);
+check("C2b: purga eliminó sesión persistida y claves derivadas", dom.window.localStorage.getItem(SB_KEY) === null && dom.window.localStorage.getItem(SB_KEY_DERIVADA) === null);
+check("C2b: la UI no trata la sesión rechazada como válida", (await auth.getCurrentUser()) === null);
 await renderAuth(root);
-check("C2: la UI de auth NO la muestra como activa", !root.textContent.includes("Sesión activa") && root.textContent.includes("Iniciar sesión"));
+check("C2b: #/auth muestra entrada, no 'Sesión activa'", !root.textContent.includes("Sesión activa") && root.textContent.includes("Iniciar sesión"));
+
+// ── Escenario 3: signOut LANZA excepción -> manejada, sin sesión aparentemente válida, sin bucle de redirección
+installMockSession();
+auth._setSbClientForTests(mockClient(async () => { throw new Error("network unreachable"); }));
+dom.window.location.hash = "#/";
+await sleep(80);
+const hashBase3 = hashChangeCount;
+let e1 = null, e2 = null;
+try { await apiMod.dashboard(); } catch (e) { e1 = e; }
+try { await apiMod.attempts(5); } catch (e) { e2 = e; }   // segunda falla con hash ya en #/auth
+await sleep(80);
+check("C2c: excepción manejada (dos 401 sin crash)", e1?.status === 401 && e2?.status === 401);
+check("C2c: sesión purgada tras excepción (storage y getCurrentUser)", dom.window.localStorage.getItem(SB_KEY) === null && (await auth.getCurrentUser()) === null);
+check("C2c: exactamente UNA redirección, sin bucle", dom.window.location.hash === "#/auth" && hashChangeCount - hashBase3 === 1);
 
 console.log(failures === 0 ? "\n🎉 FRONTEND OK — todas las verificaciones pasaron" : `\n💥 ${failures} verificaciones fallaron`);
 process.exit(failures === 0 ? 0 : 1);
