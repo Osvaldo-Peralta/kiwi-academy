@@ -9,9 +9,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
@@ -20,6 +22,46 @@ from ..core.errors import ContentError
 from .base import ContentStore, ProgressStore
 
 _STORE_LOCK = threading.RLock()   # lock global del store JSON (single-proceso)
+
+log = logging.getLogger("kiwi.storage.json")
+
+
+class TransactionRollbackError(RuntimeError):
+    """La operación original falló Y la restauración del diario falló total o
+    parcialmente: el almacenamiento puede haber quedado en estado parcial y
+    NO debe presentarse como recuperado.
+
+    Atributos (evidencia para diagnóstico):
+      original: excepción que abortó la transacción.
+      failures: [(ruta, error), ...] archivos que NO pudieron restaurarse/borrarse.
+      restored: [ruta, ...] archivos que SÍ se restauraron/borraron.
+
+    El evento queda además logueado (logging.error) y registrado en
+    `JsonProgressStore.rollback_failures` (evidencia en memoria del proceso).
+    Los archivos temporales `.rbak` de restauraciones fallidas se conservan
+    en disco como evidencia forense y material de recuperación manual.
+
+    LIMITACIÓN RESIDUAL (documentada): el rollback basado en archivos no puede
+    garantizar la recuperación completa ante cualquier fallo del sistema
+    operativo o del almacenamiento (p. ej. disco lleno, permisos revocados,
+    muerte del proceso). En ese caso esta excepción informa el fallo con el
+    detalle disponible; la reparación asistida es `tools/repair_progress.py`
+    (los intentos append-only son la fuente de verdad). No se afirma
+    atomicidad absoluta frente a fallos físicos o externos.
+    """
+
+    def __init__(self, original: BaseException, failures: list, restored: list):
+        self.original = original
+        self.failures = list(failures)
+        self.restored = list(restored)
+        detalle = "; ".join(f"{p}: {e}" for p, e in self.failures[:5])
+        super().__init__(
+            f"Rollback de transacción JSON INCOMPLETO: {len(self.failures)} "
+            f"archivo(s) no restaurado(s) [{detalle}]. Error original: "
+            f"{type(original).__name__}: {original}. El estado del almacén "
+            f"puede ser inconsistente: NO se asuma recuperado; diagnostique "
+            f"(rollback_failures / logs) y considere tools/repair_progress.py."
+        )
 
 _LOCKS: dict[str, threading.RLock] = {}
 _LOCKS_GUARD = threading.Lock()
@@ -152,6 +194,9 @@ class JsonProgressStore(ProgressStore):
     def __init__(self, root: Optional[Path] = None):
         self.root = Path(root or settings.DATA_DIR) / "users"
         self._local = threading.local()   # diario de la transacción en curso
+        # Evidencia en memoria de rollbacks incompletos (diagnóstico):
+        # [{when, user_id, original, restored, failures}, ...]
+        self.rollback_failures: list[dict[str, Any]] = []
 
     # -- diario copy-on-write (rollback real en operaciones compuestas) ------
 
@@ -169,11 +214,13 @@ class JsonProgressStore(ProgressStore):
         self._record_original(path)
         _write_json(path, data)
 
-    @staticmethod
-    def _rollback(journal: dict) -> None:
-        """Restaura los archivos registrados (borra los creados). Best-effort
-        atómico por archivo; repair_progress.py queda como mecanismo adicional
-        ante fallos extremos (p. ej. muerte del proceso a mitad del rollback)."""
+    def _rollback(self, journal: dict) -> tuple[list[str], list[tuple[str, str]]]:
+        """Restaura los archivos registrados (borra los creados), en orden
+        inverso. Best-effort POR ARCHIVO (un fallo no impide intentar el
+        resto) pero NUNCA silencia errores: devuelve (restaurados, fallos)
+        y loguea cada fallo. El llamador decide cómo comunicarlo."""
+        restored: list[str] = []
+        failures: list[tuple[str, str]] = []
         for path_str in reversed(list(journal.keys())):
             original = journal[path_str]
             path = Path(path_str)
@@ -184,8 +231,11 @@ class JsonProgressStore(ProgressStore):
                     tmp = path.with_suffix(path.suffix + ".rbak")
                     tmp.write_bytes(original)
                     os.replace(tmp, path)
-            except OSError:
-                pass
+                restored.append(path_str)
+            except OSError as exc:
+                failures.append((path_str, f"{type(exc).__name__}: {exc}"))
+                log.error("Rollback JSON: no se pudo restaurar %s: %s", path_str, exc)
+        return restored, failures
 
     # -- progreso -----------------------------------------------------------
 
@@ -296,10 +346,31 @@ class JsonProgressStore(ProgressStore):
             self._local.journal = {}
             try:
                 yield
-            except BaseException:
+            except BaseException as exc:
                 journal = self._local.journal
+                # Estado definido ANTES de intentar la restauración: ninguna
+                # transacción posterior puede reutilizar un diario obsoleto,
+                # incluso si la propia restauración falla.
                 self._local.journal = None
-                self._rollback(journal)
+                restored, failures = self._rollback(journal)
+                if failures:
+                    # La operación original falló Y la recuperación quedó
+                    # incompleta: se comunica explícitamente conservando
+                    # ambas evidencias (excepción encadenada + registro).
+                    self.rollback_failures.append({
+                        "when": datetime.now(timezone.utc).isoformat(),
+                        "user_id": user_id,
+                        "original": f"{type(exc).__name__}: {exc}",
+                        "restored": restored,
+                        "failures": failures,
+                    })
+                    log.error(
+                        "Rollback JSON INCOMPLETO (user=%s): %d archivo(s) no "
+                        "restaurado(s); estado potencialmente inconsistente. "
+                        "Error original: %r", user_id, len(failures), exc,
+                    )
+                    raise TransactionRollbackError(exc, failures, restored) from exc
+                # Rollback completo: se propaga el error original sin alterar
                 raise
             else:
                 self._local.journal = None

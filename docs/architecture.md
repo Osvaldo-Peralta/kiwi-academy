@@ -96,7 +96,7 @@ el revisor autorizado registra en la plataforma.
 | `content/**.yaml` en git | Misma estructura en tablas `courses/modules/lessons/exercises` + CMS propio, o seguir con git (recomendado: content-as-code) |
 | `data/users/<uid>/progress.json` | ✅ **Ya disponible:** tabla `kiwi_progress` vía `SqlProgressStore` (`KIWI_DATABASE_URL=postgresql://...` o `sqlite:///...`) |
 | `data/users/<uid>/attempts/*.json` | ✅ **Ya disponible:** tabla `kiwi_attempts` (una fila por intento, mismo JSON) |
-| Locks por archivo + escritura atómica (tmp+fsync+replace) | ✅ **Iteración 3:** `transaction()` y `mutate_progress()` en el puerto — SQL con transacciones reales (Postgres `SELECT…FOR UPDATE`, SQLite `BEGIN IMMEDIATE`); JSON con serialización **y rollback real** (diario copy-on-write que restaura/borra archivos al fallar) |
+| Locks por archivo + escritura atómica (tmp+fsync+replace) | ✅ **Iteración 3:** `transaction()` y `mutate_progress()` en el puerto — SQL con transacciones reales (Postgres `SELECT…FOR UPDATE`, SQLite `BEGIN IMMEDIATE`); JSON con serialización **y rollback real** (diario copy-on-write; si la restauración queda incompleta se lanza `TransactionRollbackError` con el detalle — nunca se silencia ni se presenta como recuperado; limitación residual ante fallos físicos documentada en `json_store.py`) |
 | Un proceso uvicorn local | N procesos/contenedores; el storage ya es stateless |
 
 La migración de datos existentes es un comando:

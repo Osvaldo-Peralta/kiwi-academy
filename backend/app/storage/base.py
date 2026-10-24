@@ -119,6 +119,10 @@ class ProgressStore(ABC):
           excepción => los archivos escritos durante la transacción se
           restauran/borran (rollback en proceso; el store JSON es
           single-proceso por diseño — la garantía multi-worker la da SQL).
+          Si la restauración queda incompleta, se lanza
+          `json_store.TransactionRollbackError` (encadenada al error
+          original, con detalle de archivos no restaurados): el fallo de
+          recuperación NUNCA se silencia ni se presenta como recuperado.
 
         Anidable: una transacción interna se une a la externa.
         """

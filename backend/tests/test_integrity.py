@@ -23,7 +23,7 @@ from backend.app.core.auth import TEST_JWT_SECRET, reset_verifier
 from backend.app.core.services import LearningService, exam_key, lesson_key
 from backend.app.main import app
 from backend.app.api.v1.deps import get_service
-from backend.app.storage.json_store import JsonProgressStore
+from backend.app.storage.json_store import JsonProgressStore, TransactionRollbackError
 from backend.app.storage.repositories import ContentRepository, ProgressRepository
 from backend.app.storage.sql_store import SqlProgressStore
 
@@ -475,3 +475,184 @@ def test_api_reintento_idempotente_y_propiedad(client):
     r3 = client.post(sub_url, json=body, headers=H("dev-otro"))
     assert r3.status_code == 409                       # sesión ajena -> conflicto
     assert r3.json()["error"]["reason"] == "session_invalid"
+
+
+# ---------------------------------------------------------------------------
+# Corrección PR #4: manejo explícito de fallo de rollback JSON (casos A–D)
+# Inyección controlada de fallos (proxy de os.replace acotado al módulo
+# json_store): determinista, sin depender de errores reales del filesystem.
+# ---------------------------------------------------------------------------
+
+import os as _real_os
+import backend.app.storage.json_store as _jsmod
+
+
+class _OsProxy:
+    """Delega todo en el os real salvo replace(), que puede fallar a orden."""
+    def __init__(self, real):
+        self._real = real
+        self.fail_replace = False
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def replace(self, *a, **k):
+        if self.fail_replace:
+            raise OSError(28, "No space left on device (fallo inyectado)")
+        return self._real.replace(*a, **k)
+
+
+def _base_prog(v=1):
+    return {"user_id": "dev-u", "lessons": {}, "exams": {}, "activity": {}, "v": v}
+
+
+def _att(att_id, **extra):
+    return {"id": att_id, "user_id": "dev-u", "submitted_at": "2026-01-01T00:00:00+00:00",
+            "scope": {"type": "lesson"}, "score": {}, **extra}
+
+
+# ── Caso A: fallo de operación con rollback EXITOSO ──────────────────────
+def test_caso_a_rollback_exitoso_restaura_y_propaga_error_original(tmp_path):
+    store = JsonProgressStore(root=tmp_path)
+    store.save_progress("dev-u", _base_prog(v=1))
+
+    with pytest.raises(RuntimeError) as ei:
+        with store.transaction("dev-u"):
+            store.save_attempt("dev-u", _att("att_a"))            # archivo nuevo
+            store.save_progress("dev-u", _base_prog(v=2))         # archivo modificado
+            raise RuntimeError("fallo original")
+
+    # el error ORIGINAL se propaga tal cual (no envuelto)
+    assert type(ei.value) is RuntimeError
+    assert str(ei.value) == "fallo original"
+    # archivos originales restaurados y nuevos eliminados
+    assert store.get_attempt("dev-u", "att_a") is None
+    assert store.load_progress("dev-u")["v"] == 1
+    # sin fallos de recuperación registrados
+    assert store.rollback_failures == []
+
+
+# ── Caso B: fallo DURANTE la restauración → no se silencia ───────────────
+def test_caso_b_fallo_de_restauracion_se_comunica_explicitamente(tmp_path, monkeypatch):
+    store = JsonProgressStore(root=tmp_path)
+    store.save_progress("dev-u", _base_prog(v=1))
+
+    proxy = _OsProxy(_real_os)
+    monkeypatch.setattr(_jsmod, "os", proxy)
+
+    def flaky_report(*a, **k):
+        proxy.fail_replace = True    # la restauración de modificados fallará
+        raise RuntimeError("fallo original en reporte")
+
+    monkeypatch.setattr(store, "save_report", flaky_report)
+
+    with pytest.raises(TransactionRollbackError) as ei:
+        with store.transaction("dev-u"):
+            store.save_attempt("dev-u", _att("att_b"))            # nuevo (unlink: restaurable)
+            store.save_progress("dev-u", _base_prog(v=2))         # modificado (os.replace: fallará)
+            store.save_report("dev-u", "att_b", "report.md", "x")
+
+    err = ei.value
+    # 1) conserva la excepción original (encadenada)
+    assert isinstance(err.__cause__, RuntimeError)
+    assert str(err.__cause__) == "fallo original en reporte"
+    # 2) identifica con claridad la recuperación incompleta
+    assert "INCOMPLETO" in str(err)
+    assert len(err.failures) == 1
+    failed_path = err.failures[0][0]
+    assert failed_path.endswith("progress.json")
+    assert "No space left" in err.failures[0][1]
+    # 3) lo restaurable SÍ se restauró (el archivo nuevo se eliminó)
+    assert err.restored == [str(store.root / "dev-u" / "attempts" / "att_b.json")]
+    assert store.get_attempt("dev-u", "att_b") is None
+    # 4) el estado NO se presenta como recuperado: progress sigue en v2 (parcial)
+    assert store.load_progress("dev-u")["v"] == 2
+    # 5) evidencia registrada para diagnóstico
+    assert len(store.rollback_failures) == 1
+    rec = store.rollback_failures[0]
+    assert rec["user_id"] == "dev-u"
+    assert "fallo original en reporte" in rec["original"]
+    assert rec["failures"] == err.failures
+    # 6) el .rbak queda como evidencia forense/material de recuperación
+    assert (store.root / "dev-u" / "progress.json.rbak").exists()
+
+
+# ── Caso C: varios archivos modificados ──────────────────────────────────
+def test_caso_c_varios_archivos_restaurables_y_fallidos(tmp_path, monkeypatch):
+    store = JsonProgressStore(root=tmp_path)
+    store.save_progress("dev-u", _base_prog(v=1))
+    store.save_attempt("dev-u", _att("att_viejo"))     # preexistente -> será modificado
+
+    proxy = _OsProxy(_real_os)
+    monkeypatch.setattr(_jsmod, "os", proxy)
+
+    def flaky_report(*a, **k):
+        proxy.fail_replace = True
+        raise RuntimeError("fallo original")
+
+    monkeypatch.setattr(store, "save_report", flaky_report)
+
+    with pytest.raises(TransactionRollbackError) as ei:
+        with store.transaction("dev-u"):
+            store.save_attempt("dev-u", _att("att_nuevo"))                  # nuevo
+            store.update_attempt("dev-u", _att("att_viejo", score={"x": 1}))  # modificado
+            store.save_progress("dev-u", _base_prog(v=2))                   # modificado
+            store.save_report("dev-u", "att_nuevo", "report.md", "x")
+
+    err = ei.value
+    failed_paths = {p for p, _ in err.failures}
+    assert failed_paths == {
+        str(store.root / "dev-u" / "progress.json"),
+        str(store.root / "dev-u" / "attempts" / "att_viejo.json"),
+    }
+    # todo lo restaurable quedó restaurado (el archivo nuevo, eliminado)
+    assert err.restored == [str(store.root / "dev-u" / "attempts" / "att_nuevo.json")]
+    assert store.get_attempt("dev-u", "att_nuevo") is None
+    # cada restauración fallida quedó EXPLÍCITAMENTE registrada
+    assert len(store.rollback_failures) == 1
+    assert {p for p, _ in store.rollback_failures[0]["failures"]} == failed_paths
+
+
+# ── Caso D: estado transaccional definido tras rollback fallido ──────────
+def test_caso_d_estado_transaccional_definido_y_sin_diario_obsoleto(tmp_path, monkeypatch):
+    store = JsonProgressStore(root=tmp_path)
+    store.save_progress("dev-u", _base_prog(v=1))
+
+    proxy = _OsProxy(_real_os)
+    monkeypatch.setattr(_jsmod, "os", proxy)
+
+    def flaky_report(*a, **k):
+        proxy.fail_replace = True
+        raise RuntimeError("fallo original")
+
+    monkeypatch.setattr(store, "save_report", flaky_report)
+
+    with pytest.raises(TransactionRollbackError):
+        with store.transaction("dev-u"):
+            store.save_attempt("dev-u", _att("att_d"))
+            store.save_progress("dev-u", _base_prog(v=2))
+            store.save_report("dev-u", "att_d", "report.md", "x")
+
+    # 1) estado local DEFINIDO: diario limpio pese al fallo de restauración
+    assert getattr(store._local, "journal", None) is None
+    assert len(store.rollback_failures) == 1
+
+    # 2) el store sigue utilizable: sanear el FS y operar de nuevo
+    proxy.fail_replace = False
+    prog_tx2 = dict(_base_prog(v=3), marker="tx2")
+    with store.transaction("dev-u"):
+        store.save_progress("dev-u", prog_tx2)
+    assert store.load_progress("dev-u")["marker"] == "tx2"
+
+    # 3) nueva transacción fallida con rollback EXITOSO: restaura al estado
+    #    inmediatamente anterior (tx2) — el diario es fresco, no se mezcla
+    #    con el de la transacción fallida anterior
+    with pytest.raises(ValueError):
+        with store.transaction("dev-u"):
+            store.save_progress("dev-u", dict(prog_tx2, marker="tx3"))
+            raise ValueError("fallo nuevo controlado")
+    prog = store.load_progress("dev-u")
+    assert prog["marker"] == "tx2" and prog["v"] == 3
+    # 4) sin nuevos fallos de rollback; diario nuevamente limpio
+    assert len(store.rollback_failures) == 1
+    assert getattr(store._local, "journal", None) is None
