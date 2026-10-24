@@ -96,11 +96,19 @@ el revisor autorizado registra en la plataforma.
 | `content/**.yaml` en git | Misma estructura en tablas `courses/modules/lessons/exercises` + CMS propio, o seguir con git (recomendado: content-as-code) |
 | `data/users/<uid>/progress.json` | ✅ **Ya disponible:** tabla `kiwi_progress` vía `SqlProgressStore` (`KIWI_DATABASE_URL=postgresql://...` o `sqlite:///...`) |
 | `data/users/<uid>/attempts/*.json` | ✅ **Ya disponible:** tabla `kiwi_attempts` (una fila por intento, mismo JSON) |
-| Locks por archivo + escritura atómica (tmp+fsync+replace) | Transacciones SQL (el driver ya hace commit por operación) |
+| Locks por archivo + escritura atómica (tmp+fsync+replace) | ✅ **Iteración 3:** `transaction()` y `mutate_progress()` en el puerto — SQL con transacciones reales (Postgres `SELECT…FOR UPDATE`, SQLite `BEGIN IMMEDIATE`); JSON serializa en proceso |
 | Un proceso uvicorn local | N procesos/contenedores; el storage ya es stateless |
 
 La migración de datos existentes es un comando:
 `KIWI_DATABASE_URL=... python tools/migrate_json_to_sql.py` (idempotente).
+
+**Iteración 3 — integridad:** los intentos (append-only) son la fuente de
+verdad; los agregados del progreso son datos derivados y reconstruibles con
+`tools/repair_progress.py` (`LearningService.rebuild_progress_from_attempts`).
+La idempotencia de envíos de examen usa la sesión de servidor como clave:
+reenviar una sesión consumida reproduce el resultado original
+(`idempotent_replay: true`) sin duplicar intentos. Los reportes tienen guarda
+de propiedad: nunca se sobrescribe/reasigna el de otro usuario.
 Para cambiar de backend de progreso solo cambia la variable de entorno — la
 fábrica (`storage/factory.py`) elige implementación; los servicios no cambian.
 

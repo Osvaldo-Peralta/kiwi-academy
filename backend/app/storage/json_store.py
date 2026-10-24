@@ -11,12 +11,15 @@ from __future__ import annotations
 import json
 import os
 import threading
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Iterator, Optional
 
 from ..config import settings
 from ..core.errors import ContentError
 from .base import ContentStore, ProgressStore
+
+_STORE_LOCK = threading.RLock()   # lock global del store JSON (single-proceso)
 
 _LOCKS: dict[str, threading.RLock] = {}
 _LOCKS_GUARD = threading.Lock()
@@ -224,7 +227,9 @@ class JsonProgressStore(ProgressStore):
 
     # -- reportes exportados ----------------------------------------------------------------
 
-    def save_report(self, user_id: str, attempt_id: str, name: str, content: str) -> str:
+    def save_report(self, user_id: str, attempt_id: str, name: str, content: str) -> Optional[str]:
+        # Propiedad estructural: los reportes viven bajo el directorio del
+        # usuario; es imposible sobrescribir el reporte de OTRO usuario.
         d = self.root / user_id / "reports"
         d.mkdir(parents=True, exist_ok=True)
         safe_attempt = "".join(c for c in attempt_id if c.isalnum() or c in "-_")
@@ -233,3 +238,20 @@ class JsonProgressStore(ProgressStore):
         with _lock_for(str(path)):
             path.write_text(content, encoding="utf-8")
         return str(path)
+
+    # -- Iteración 3: atomicidad (single-proceso por diseño) -------------------
+
+    @contextmanager
+    def transaction(self, user_id: str) -> Iterator[None]:
+        """Lock global del store: serializa operaciones compuestas
+        (attempt+progreso+reporte) dentro del proceso. El store JSON es
+        single-proceso por diseño; la garantía multi-worker la da el SQL."""
+        with _STORE_LOCK:
+            yield
+
+    def mutate_progress(self, user_id: str, fn: Callable[[dict[str, Any]], Any]) -> Any:
+        with _STORE_LOCK:
+            prog = self.load_progress(user_id)
+            out = fn(prog)
+            self.save_progress(user_id, prog)
+            return out

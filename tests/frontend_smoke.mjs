@@ -168,20 +168,31 @@ await sleep(1800);
 check("Iter2: veredicto PENDIENTE DE REVISIÓN HUMANA en la UI", root.textContent.includes("PENDIENTE DE REVISIÓN HUMANA"));
 check("Iter2: resultado provisional explicado (parte automática)", root.textContent.includes("PROVISIONAL") || root.textContent.includes("provisional"));
 
-// ── Iteración 2: rechazos controlados vía API (sesión + validación)
+// ── Iteración 2/3: rechazos controlados vía API (validación + sesión)
 const tok = await auth.getToken();
-const r409 = await realFetch(`${API}/api/v1/courses/soc-n1/exams/fase-1-examen/attempts`, {
+const examQ = await (await realFetch(`${API}/api/v1/courses/soc-n1/exams/fase-1-examen`, {
+  headers: { Authorization: `Bearer ${tok}` },
+})).json();
+// payload malformado (responses vacío) -> 422 ANTES de evaluar la sesión
+const r422empty = await realFetch(`${API}/api/v1/courses/soc-n1/exams/fase-1-examen/attempts`, {
   method: "POST",
   headers: { "Content-Type": "application/json", Authorization: `Bearer ${tok}` },
   body: JSON.stringify({ session_id: "sesion-falsa", responses: [] }),
+});
+check("Iter2: respuestas malformadas -> rechazo controlado 422", r422empty.status === 422);
+// respuestas válidas + sesión falsa -> 409
+const r409 = await realFetch(`${API}/api/v1/courses/soc-n1/exams/fase-1-examen/attempts`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json", Authorization: `Bearer ${tok}` },
+  body: JSON.stringify({
+    session_id: "sesion-falsa",
+    responses: examQ.questions.map(q => ({ exercise_id: q.id, answer: null })),
+  }),
 });
 check("Iter2: envío sin sesión válida -> 409", r409.status === 409);
 
 const sess = await (await realFetch(`${API}/api/v1/courses/soc-n1/exams/fase-1-examen/sessions`, {
   method: "POST", headers: { Authorization: `Bearer ${tok}` },
-})).json();
-const examQ = await (await realFetch(`${API}/api/v1/courses/soc-n1/exams/fase-1-examen`, {
-  headers: { Authorization: `Bearer ${tok}` },
 })).json();
 const dupResp = examQ.questions.map(q => ({ exercise_id: q.id, answer: null }));
 dupResp.push({ exercise_id: dupResp[0].exercise_id, answer: null });

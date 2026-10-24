@@ -4,11 +4,16 @@ La lógica de negocio depende SOLO de estas interfaces abstractas.
 Hoy las implementa `json_store` (archivos); mañana una implementación
 SQL/NoSQL puede reemplazarla sin tocar ni una línea de la API ni del
 motor de evaluación. Este es el punto de costura para escalar.
+
+Iteración 3: el puerto incluye `transaction()` (agrupación atómica de
+operaciones relacionadas) y `mutate_progress()` (read-modify-write atómico
+del progreso, política contra actualizaciones perdidas).
 """
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Optional
+from contextlib import contextmanager
+from typing import Any, Callable, Iterator, Optional
 
 
 class ContentStore(ABC):
@@ -91,4 +96,31 @@ class ProgressStore(ABC):
     def list_attempts(self, user_id: str, limit: int = 50) -> list[dict[str, Any]]: ...
 
     @abstractmethod
-    def save_report(self, user_id: str, attempt_id: str, name: str, content: str) -> str: ...
+    def save_report(self, user_id: str, attempt_id: str, name: str, content: str) -> Optional[str]:
+        """Guarda un reporte. NUNCA debe sobrescribir/reasignar un reporte
+        propiedad de OTRO usuario: si (attempt_id, name) ya existe con dueño
+        distinto, devuelve None (denegado) sin modificar nada."""
+
+    # -- Iteración 3: atomicidad ---------------------------------------------
+
+    @abstractmethod
+    @contextmanager
+    def transaction(self, user_id: str) -> Iterator[None]:
+        """Contexto transaccional para el usuario: las operaciones del store
+        ejecutadas dentro comparten una única unidad atómica.
+
+        - SQL: transacción real (Postgres BEGIN + bloqueo de fila
+          SELECT…FOR UPDATE sobre kiwi_progress; SQLite BEGIN IMMEDIATE con
+          busy-timeout). Excepción => ROLLBACK completo.
+        - JSON: lock de store (serializa operaciones compuestas en el
+          proceso; el store JSON es single-proceso por diseño — la garantía
+          multi-worker la da el store SQL).
+
+        Anidable: una transacción interna se une a la externa.
+        """
+
+    @abstractmethod
+    def mutate_progress(self, user_id: str, fn: Callable[[dict[str, Any]], Any]) -> Any:
+        """Read-modify-write ATÓMICO del progreso (política definida contra
+        actualizaciones perdidas): load -> fn(prog) -> save bajo transacción.
+        `fn` muta el dict en lugar y devuelve un valor arbitrario."""

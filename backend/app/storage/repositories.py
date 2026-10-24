@@ -118,6 +118,23 @@ class ProgressRepository:
         progress["updated_at"] = datetime.now(timezone.utc).isoformat()
         self.store.save_progress(user_id, progress)
 
+    # -- Iteración 3: atomicidad -------------------------------------------------
+
+    def transaction(self, user_id: str):
+        """Contexto transaccional del store (ver ProgressStore.transaction)."""
+        return self.store.transaction(user_id)
+
+    def mutate_progress(self, user_id: str, fn):
+        """Read-modify-write atómico; sella updated_at como save_progress."""
+        from datetime import datetime, timezone
+
+        def wrapped(prog):
+            out = fn(prog)
+            prog["updated_at"] = datetime.now(timezone.utc).isoformat()
+            return out
+
+        return self.store.mutate_progress(user_id, wrapped)
+
     def new_attempt_id(self) -> str:
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
         digest = hashlib.sha1(os.urandom(8)).hexdigest()[:6]

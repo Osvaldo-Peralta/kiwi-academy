@@ -145,19 +145,22 @@ class LearningService:
         examples_viewed: Optional[bool] = None,
     ) -> dict[str, Any]:
         lesson = self.content.get_lesson(course_id, module_id, lesson_id)
-        prog = self.progress.get_progress(user_id)
         key = lesson_key(course_id, module_id, lesson_id)
-        lp = prog.setdefault("lessons", {}).setdefault(key, self._empty_lesson_progress(lesson))
-        self._sync_lesson_totals(lp, lesson)
-        if theory_completed is not None:
-            lp["theory_completed"] = bool(theory_completed)
-        if examples_viewed is not None:
-            lp["examples_viewed"] = bool(examples_viewed)
-        self._recompute_lesson_status(lp)
-        lp["last_activity_at"] = _now().isoformat()
-        self._touch_activity(prog)
-        self.progress.save_progress(user_id, prog)
-        return lp
+
+        def _mut(prog: dict[str, Any]) -> dict[str, Any]:
+            lp = prog.setdefault("lessons", {}).setdefault(key, self._empty_lesson_progress(lesson))
+            self._sync_lesson_totals(lp, lesson)
+            if theory_completed is not None:
+                lp["theory_completed"] = bool(theory_completed)
+            if examples_viewed is not None:
+                lp["examples_viewed"] = bool(examples_viewed)
+            self._recompute_lesson_status(lp)
+            lp["last_activity_at"] = _now().isoformat()
+            self._touch_activity(prog)
+            return lp
+
+        # Iteración 3 (DATA-03): read-modify-write atómico
+        return dict(self.progress.mutate_progress(user_id, _mut))
 
     def attempt_lesson_exercise(
         self, user_id: str, course_id: str, module_id: str, lesson_id: str,
@@ -197,31 +200,35 @@ class LearningService:
             },
             results=[result],
         )
-        self.progress.save_attempt(user_id, attempt.model_dump(mode="json"))
-
-        # Actualizar progreso de la lección
-        prog = self.progress.get_progress(user_id)
         key = lesson_key(course_id, module_id, lesson_id)
-        lp = prog.setdefault("lessons", {}).setdefault(key, self._empty_lesson_progress(lesson))
-        self._sync_lesson_totals(lp, lesson)
-        lp["attempts"] = lp.get("attempts", 0) + 1
-        mastered = lp.setdefault("mastered_exercises", [])
-        reviewed = lp.setdefault("reviewed_exercises", [])
-        if ex.type == "free_text":
-            # respuesta libre enviada y no vacía => queda "respondida" (revisión
-            # humana/IA vía reporte); cuenta para completar la lección
-            if outcome.needs_review and ex.id not in reviewed:
-                reviewed.append(ex.id)
-        elif outcome.correct and ex.id not in mastered:
-            mastered.append(ex.id)
-        lp["exercises_mastered"] = len(mastered)
-        # accuracy histórica sobre ejercicios autocorregibles
-        acc = lp.get("best_accuracy", 0.0)
-        lp["best_accuracy"] = max(acc, outcome.ratio) if outcome.correct is not None else acc
-        self._recompute_lesson_status(lp)
-        lp["last_activity_at"] = _now().isoformat()
-        self._touch_activity(prog)
-        self.progress.save_progress(user_id, prog)
+
+        def _mut(prog: dict[str, Any]) -> dict[str, Any]:
+            lp = prog.setdefault("lessons", {}).setdefault(key, self._empty_lesson_progress(lesson))
+            self._sync_lesson_totals(lp, lesson)
+            lp["attempts"] = lp.get("attempts", 0) + 1
+            mastered = lp.setdefault("mastered_exercises", [])
+            reviewed = lp.setdefault("reviewed_exercises", [])
+            if ex.type == "free_text":
+                # respuesta libre enviada y no vacía => queda "respondida"
+                # (revisión humana/IA vía reporte); cuenta para completar
+                if outcome.needs_review and ex.id not in reviewed:
+                    reviewed.append(ex.id)
+            elif outcome.correct and ex.id not in mastered:
+                mastered.append(ex.id)
+            lp["exercises_mastered"] = len(mastered)
+            # accuracy histórica sobre ejercicios autocorregibles
+            acc = lp.get("best_accuracy", 0.0)
+            lp["best_accuracy"] = max(acc, outcome.ratio) if outcome.correct is not None else acc
+            self._recompute_lesson_status(lp)
+            lp["last_activity_at"] = _now().isoformat()
+            self._touch_activity(prog)
+            return lp
+
+        # Iteración 3 (DATA-01/03): intento + progreso en UNA transacción;
+        # si algo falla, no quedan registros en estados incompatibles.
+        with self.progress.transaction(user_id):
+            self.progress.save_attempt(user_id, attempt.model_dump(mode="json"))
+            lp = self.progress.mutate_progress(user_id, _mut)
 
         return {
             "exercise_id": ex.id,
@@ -255,15 +262,17 @@ class LearningService:
         if exam.time_limit_minutes:
             deadline_unix = now.timestamp() + exam.time_limit_minutes * 60 + settings.EXAM_GRACE_SECONDS
 
-        prog = self.progress.get_progress(user_id)
-        sessions = prog.setdefault(SESSIONS_KEY, {})
         key = exam_key(course_id, exam_id)
-        sessions[key] = {
-            "session_id": session_id,
-            "started_at": now.isoformat(),
-            "deadline_unix": deadline_unix,
-        }
-        self.progress.save_progress(user_id, prog)
+
+        def _mut(prog: dict[str, Any]) -> None:
+            sessions = prog.setdefault(SESSIONS_KEY, {})
+            sessions[key] = {
+                "session_id": session_id,
+                "started_at": now.isoformat(),
+                "deadline_unix": deadline_unix,
+            }
+
+        self.progress.mutate_progress(user_id, _mut)
         return {
             "exam_id": exam_id,
             "session_id": session_id,
@@ -273,6 +282,26 @@ class LearningService:
             "grace_seconds": settings.EXAM_GRACE_SECONDS if exam.time_limit_minutes else 0,
         }
 
+    def _replay_exam_response(self, attempt_data: dict[str, Any], exam, course) -> dict[str, Any]:
+        """Iteración 3 (DATA-02): reproducción del resultado original para un
+        reintento con la misma sesión (idempotencia exacta: mismo attempt_id,
+        ningún efecto duplicado)."""
+        attempt = Attempt.model_validate(attempt_data)
+        md = render_report_markdown(
+            attempt, exam.questions,
+            course_title=course.title, scope_title=exam.title,
+        )
+        return {
+            "attempt_id": attempt.id,
+            "score": attempt.score,
+            "results": [r.model_dump(mode="json") for r in attempt.results],
+            "feedback_summary": attempt.feedback_summary,
+            "weak_tags": attempt.weak_tags,
+            "recommendations": attempt.recommendations,
+            "report_markdown": md,
+            "idempotent_replay": True,
+        }
+
     def submit_exam(
         self, user_id: str, course_id: str, exam_id: str,
         session_id: str,
@@ -280,169 +309,196 @@ class LearningService:
     ) -> dict[str, Any]:
         """Corrige el examen completo.
 
-        Iteración 2:
-        - exige sesión válida emitida por el servidor (una sola vez);
-        - valida ids/duplicados/orden/estructura (rechazo controlado 422);
-        - las respuestas libres con contenido quedan PENDIENTES de revisión
-          humana: el examen no se aprueba ni se reprueba definitivamente;
-        - puntaje provisional (parte automática) separado del definitivo;
-        - el tiempo lo mide el servidor (started_at/duration del cliente no
-          existen en el contrato).
+        Iteración 2: sesión de servidor (tiempo), validación estricta,
+        puntaje provisional y respuestas libres pendientes de revisión.
+        Iteración 3 (DATA-01/02/03):
+        - TODO el flujo (chequeos + intento + progreso + reporte) corre en
+          UNA transacción del store: fallo => rollback, cero estados parciales
+          (SQL) o reparación derivable desde los intentos (JSON, single-proceso).
+        - La sesión es la clave de idempotencia: reenviar una sesión ya
+          consumida NO duplica el intento; reproduce el resultado original
+          (`idempotent_replay: true`). Dos envíos concurrentes con la misma
+          sesión se serializan: uno califica y el otro recibe el replay.
         """
         exam = self.content.get_exam(course_id, exam_id)
-        now = _now()
+        course = self.content.get_course(course_id)
         key = exam_key(course_id, exam_id)
 
-        # 1) Sesión emitida por el servidor (EVAL-02)
-        prog = self.progress.get_progress(user_id)
-        sessions = prog.get(SESSIONS_KEY, {})
-        session = sessions.get(key)
-        if not session or session.get("session_id") != session_id:
+        # Validación estructural (pura; antes de tocar estado)
+        by_id = validate_exam_responses(exam, responses)
+
+        outcome_kind = "ok"
+        payload: Any = None
+
+        with self.progress.transaction(user_id):
+            now = _now()
+            prog = self.progress.get_progress(user_id)
+            sessions = prog.get(SESSIONS_KEY, {}) or {}
+            session = sessions.get(key)
+
+            if not session or session.get("session_id") != session_id:
+                outcome_kind, payload = "invalid", None
+            elif session.get("consumed_attempt"):
+                # (a) reintento idempotente: reproducir el resultado original
+                original = self.progress.store.get_attempt(user_id, session["consumed_attempt"])
+                if original:
+                    outcome_kind, payload = "replay", self._replay_exam_response(original, exam, course)
+                else:
+                    outcome_kind, payload = "invalid", None
+            else:
+                deadline = session.get("deadline_unix")
+                if deadline is not None and now.timestamp() > float(deadline):
+                    # (b) expirada según reloj de servidor: invalidar y rechazar
+                    sessions.pop(key, None)
+                    prog[SESSIONS_KEY] = sessions
+                    self.progress.save_progress(user_id, prog)
+                    outcome_kind, payload = "expired", None
+                else:
+                    # (c) corrección (CPU pura dentro de la transacción)
+                    results: list[QuestionResult] = []
+                    points_total = 0
+                    auto_points_total = 0
+                    pending_points_total = 0
+                    points_earned_auto = 0.0
+                    pending_review = 0
+                    for q in exam.questions:
+                        answer = by_id.get(q.id)
+                        g = grade_exercise(q, answer)
+                        review_status = "auto"
+                        if q.type == "free_text":
+                            review_status = (g.detail or {}).get(
+                                "review_status", "pending" if g.needs_review else "not_answered")
+                        earned = round(q.points * g.ratio, 2)
+                        points_total += q.points
+                        if review_status == "pending":
+                            pending_points_total += q.points
+                            pending_review += 1
+                            earned = 0.0
+                        else:
+                            auto_points_total += q.points
+                            points_earned_auto += earned
+                        results.append(QuestionResult(
+                            exercise_id=q.id, type=q.type, submitted=answer,
+                            correct=g.correct, partial=(0 < g.ratio < 1),
+                            points_earned=earned, points_total=q.points,
+                            feedback=g.feedback, explanation=q.explanation,
+                            tags=q.tags, review_status=review_status,
+                        ))
+
+                    status = "pending_review" if pending_review else "auto_graded"
+                    provisional_percent = (
+                        round((points_earned_auto / auto_points_total) * 100, 1)
+                        if auto_points_total else 0.0
+                    )
+                    passed = None if status == "pending_review" else (provisional_percent >= exam.pass_score)
+                    final_percent = None if status == "pending_review" else provisional_percent
+
+                    tag_map = self.tag_to_lessons(course_id)
+                    summary, weak, recs = build_attempt_feedback(results, provisional_percent, passed, tag_map)
+                    if status == "pending_review":
+                        summary = (
+                            f"⏳ Resultado PROVISIONAL sobre la parte automática "
+                            f"({pending_review} respuesta(s) libre(s) pendientes de revisión humana; "
+                            f"el examen no está aprobado ni reprobado hasta completarla). " + summary
+                        )
+                        recs.insert(0, (
+                            "Espera la revisión humana de tus respuestas libres: hasta entonces "
+                            "el veredicto definitivo queda suspendido (los puntos libres no se "
+                            "otorgan automáticamente)."
+                        ))
+
+                    started_iso = session.get("started_at")
+                    started_dt = datetime.fromisoformat(started_iso) if started_iso else None
+                    duration = int((now - started_dt).total_seconds()) if started_dt else None
+
+                    attempt = Attempt(
+                        id=self.progress.new_attempt_id(),
+                        user_id=user_id,
+                        scope={
+                            "type": "exam", "course_id": course_id,
+                            "module_id": exam.module_id, "exam_id": exam_id,
+                        },
+                        started_at=started_dt,
+                        submitted_at=now,
+                        duration_seconds=duration,
+                        score={
+                            "points_total": points_total,
+                            "auto_points_total": auto_points_total,
+                            "pending_points_total": pending_points_total,
+                            "points_earned_auto": round(points_earned_auto, 2),
+                            "points_earned_reviewed": 0.0,
+                            "points_earned": round(points_earned_auto, 2),
+                            "provisional_percent": provisional_percent,
+                            "percent": provisional_percent,
+                            "final_percent": final_percent,
+                            "status": status,
+                            "passed": passed,
+                            "pass_score": exam.pass_score,
+                            "pending_review": pending_review,
+                        },
+                        results=results,
+                        weak_tags=weak,
+                        feedback_summary=summary,
+                        recommendations=recs,
+                    )
+                    attempt_data = attempt.model_dump(mode="json")
+
+                    # (d) persistencia atómica: intento + sesión consumida +
+                    # agregados + reporte, todo dentro de la transacción
+                    self.progress.save_attempt(user_id, attempt_data)
+
+                    def _mut(prog: dict[str, Any]) -> None:
+                        sess = prog.setdefault(SESSIONS_KEY, {})
+                        rec = dict(sess.get(key) or {})
+                        rec["consumed_attempt"] = attempt.id
+                        rec["consumed_at"] = now.isoformat()
+                        sess[key] = rec
+                        ep = prog.setdefault("exams", {}).setdefault(
+                            key, {"attempts": 0, "best_percent": 0.0, "passed": False}
+                        )
+                        ep["attempts"] = ep.get("attempts", 0) + 1
+                        ep["last_attempt_id"] = attempt.id
+                        ep["last_attempt_at"] = now.isoformat()
+                        ep["last_status"] = status
+                        if status == "auto_graded":
+                            ep["best_percent"] = max(ep.get("best_percent", 0.0), provisional_percent)
+                            ep["passed"] = bool(ep.get("passed") or passed)
+                        self._touch_activity(prog)
+
+                    self.progress.mutate_progress(user_id, _mut)
+                    md = render_report_markdown(
+                        attempt, exam.questions,
+                        course_title=course.title, scope_title=exam.title,
+                    )
+                    self.progress.save_report(user_id, attempt.id, "report.md", md)
+                    outcome_kind = "ok"
+                    payload = {
+                        "attempt_id": attempt.id,
+                        "score": attempt.score,
+                        "results": [r.model_dump(mode="json") for r in results],
+                        "feedback_summary": summary,
+                        "weak_tags": weak,
+                        "recommendations": recs,
+                        "report_markdown": md,
+                        "idempotent_replay": False,
+                    }
+
+        # Errores de estado se lanzan FUERA de la transacción (lo escrito en
+        # cada rama —p.ej. invalidación por expiración— ya se commiteó).
+        if outcome_kind == "invalid":
             raise ExamStateError(
-                "Sesión de examen inválida, inexistente o ya consumida. "
-                "Inicia el examen para que el servidor emita una sesión.",
+                "Sesión de examen inválida, inexistente o ya consumida sin "
+                "registro original. Inicia el examen para que el servidor "
+                "emita una sesión.",
                 reason="session_invalid",
             )
-        deadline = session.get("deadline_unix")
-        if deadline is not None and now.timestamp() > float(deadline):
-            # sesión expirada: se invalida (consumida) y se rechaza el envío
-            sessions.pop(key, None)
-            prog[SESSIONS_KEY] = sessions
-            self.progress.save_progress(user_id, prog)
+        if outcome_kind == "expired":
             raise ExamStateError(
                 "El tiempo límite autorizado ya expiró (verificación de servidor). "
                 "La sesión fue invalidada; inicia el examen de nuevo.",
                 reason="exam_expired",
             )
-
-        # 2) Validación estricta de respuestas (EVAL-03 / QA-04)
-        by_id = validate_exam_responses(exam, responses)
-
-        # 3) Corrección: parte automática + pendientes de revisión humana
-        results: list[QuestionResult] = []
-        points_total = 0
-        auto_points_total = 0
-        pending_points_total = 0
-        points_earned_auto = 0.0
-        pending_review = 0
-        for q in exam.questions:
-            answer = by_id.get(q.id)
-            outcome = grade_exercise(q, answer)
-            review_status = "auto"
-            if q.type == "free_text":
-                review_status = (outcome.detail or {}).get(
-                    "review_status", "pending" if outcome.needs_review else "not_answered")
-            earned = round(q.points * outcome.ratio, 2)
-            points_total += q.points
-            if review_status == "pending":
-                pending_points_total += q.points
-                pending_review += 1
-                earned = 0.0  # ninguna palabra clave suma puntos automáticamente
-            else:
-                auto_points_total += q.points
-                points_earned_auto += earned
-            results.append(QuestionResult(
-                exercise_id=q.id, type=q.type, submitted=answer,
-                correct=outcome.correct, partial=(0 < outcome.ratio < 1),
-                points_earned=earned, points_total=q.points,
-                feedback=outcome.feedback, explanation=q.explanation,
-                tags=q.tags, review_status=review_status,
-            ))
-
-        status = "pending_review" if pending_review else "auto_graded"
-        provisional_percent = (
-            round((points_earned_auto / auto_points_total) * 100, 1)
-            if auto_points_total else 0.0
-        )
-        # Criterio de aceptación: pendiente de revisión => NUNCA passed/failed
-        passed = None if status == "pending_review" else (provisional_percent >= exam.pass_score)
-        final_percent = None if status == "pending_review" else provisional_percent
-
-        tag_map = self.tag_to_lessons(course_id)
-        summary, weak, recs = build_attempt_feedback(results, provisional_percent, passed, tag_map)
-        if status == "pending_review":
-            summary = (
-                f"⏳ Resultado PROVISIONAL sobre la parte automática "
-                f"({pending_review} respuesta(s) libre(s) pendientes de revisión humana; "
-                f"el examen no está aprobado ni reprobado hasta completarla). " + summary
-            )
-            recs.insert(0, (
-                "Espera la revisión humana de tus respuestas libres: hasta entonces "
-                "el veredicto definitivo queda suspendido (los puntos libres no se "
-                "otorgan automáticamente)."
-            ))
-
-        started_iso = session.get("started_at")
-        started_dt = datetime.fromisoformat(started_iso) if started_iso else None
-        duration = int((now - started_dt).total_seconds()) if started_dt else None
-
-        attempt = Attempt(
-            id=self.progress.new_attempt_id(),
-            user_id=user_id,
-            scope={
-                "type": "exam", "course_id": course_id,
-                "module_id": exam.module_id, "exam_id": exam_id,
-            },
-            started_at=started_dt,
-            submitted_at=now,
-            duration_seconds=duration,
-            score={
-                "points_total": points_total,
-                "auto_points_total": auto_points_total,
-                "pending_points_total": pending_points_total,
-                "points_earned_auto": round(points_earned_auto, 2),
-                "points_earned_reviewed": 0.0,
-                "points_earned": round(points_earned_auto, 2),
-                "provisional_percent": provisional_percent,
-                "percent": provisional_percent,
-                "final_percent": final_percent,
-                "status": status,
-                "passed": passed,
-                "pass_score": exam.pass_score,
-                "pending_review": pending_review,
-            },
-            results=results,
-            weak_tags=weak,
-            feedback_summary=summary,
-            recommendations=recs,
-        )
-        attempt_data = attempt.model_dump(mode="json")
-        self.progress.save_attempt(user_id, attempt_data)
-
-        # 4) Consume la sesión (one-shot) y actualiza agregados del examen
-        sessions.pop(key, None)
-        prog[SESSIONS_KEY] = sessions
-        ep = prog.setdefault("exams", {}).setdefault(
-            key, {"attempts": 0, "best_percent": 0.0, "passed": False}
-        )
-        ep["attempts"] = ep.get("attempts", 0) + 1
-        ep["last_attempt_id"] = attempt.id
-        ep["last_attempt_at"] = now.isoformat()
-        ep["last_status"] = status
-        if status == "auto_graded":
-            # solo los veredictos definitivos alimentan best/passed
-            ep["best_percent"] = max(ep.get("best_percent", 0.0), provisional_percent)
-            ep["passed"] = bool(ep.get("passed") or passed)
-        self._touch_activity(prog)
-        self.progress.save_progress(user_id, prog)
-
-        # 5) Reporte exportable (feedback con IA/mentor)
-        course = self.content.get_course(course_id)
-        md = render_report_markdown(
-            attempt, exam.questions,
-            course_title=course.title, scope_title=exam.title,
-        )
-        self.progress.save_report(user_id, attempt.id, "report.md", md)
-
-        return {
-            "attempt_id": attempt.id,
-            "score": attempt.score,
-            "results": [r.model_dump(mode="json") for r in results],
-            "feedback_summary": summary,
-            "weak_tags": weak,
-            "recommendations": recs,
-            "report_markdown": md,
-        }
+        return payload
 
     # ------------------------------------------------------------------
     # Revisión humana (Iteración 2)
@@ -599,18 +655,23 @@ class LearningService:
                 reason="not_pending",
             )
 
-        # Agregados del examen en el progreso del propietario
+        # Agregados del examen en el progreso del propietario (Iteración 3:
+        # mutate atómico — DATA-03). El CAS del intento y este mutate son dos
+        # operaciones atómicas individuales; la ventana entre ellas se cubre
+        # con rebuild_progress_from_attempts (recuperación probada).
         if owner_id:
-            prog = self.progress.get_progress(owner_id)
             key = exam_key(attempt.scope.course_id, attempt.scope.exam_id or "")
-            ep = prog.setdefault("exams", {}).setdefault(
-                key, {"attempts": 0, "best_percent": 0.0, "passed": False}
-            )
-            ep["best_percent"] = max(ep.get("best_percent", 0.0), final_percent)
-            ep["passed"] = bool(ep.get("passed") or s["passed"])
-            if ep.get("last_attempt_id") == attempt.id:
-                ep["last_status"] = "reviewed"
-            self.progress.save_progress(owner_id, prog)
+
+            def _mut(prog: dict[str, Any]) -> None:
+                ep = prog.setdefault("exams", {}).setdefault(
+                    key, {"attempts": 0, "best_percent": 0.0, "passed": False}
+                )
+                ep["best_percent"] = max(ep.get("best_percent", 0.0), final_percent)
+                ep["passed"] = bool(ep.get("passed") or s["passed"])
+                if ep.get("last_attempt_id") == attempt.id:
+                    ep["last_status"] = "reviewed"
+
+            self.progress.mutate_progress(owner_id, _mut)
 
         # Reporte regenerado con el resultado definitivo
         exam = self.content.get_exam(attempt.scope.course_id, attempt.scope.exam_id or "")
@@ -631,6 +692,86 @@ class LearningService:
             "review": attempt.review,
             "report_markdown": md,
         }
+
+    # ------------------------------------------------------------------
+    # Recuperación (Iteración 3, DATA-06): los intentos (append-only) son la
+    # fuente de verdad; los agregados del progreso son datos derivados y
+    # pueden reconstruirse tras un fallo parcial.
+    # ------------------------------------------------------------------
+
+    def rebuild_progress_from_attempts(self, user_id: str) -> dict[str, Any]:
+        """Reconstruye los agregados derivados (exams y dominio de ejercicios
+        por lección) desde el historial de intentos. Preserva datos no
+        derivados (theory_completed, examples_viewed, activity, sesiones).
+
+        Uso: recuperación tras estado parcial (store JSON/crash) y herramienta
+        de consistencia (tools/repair_progress.py). Idempotente.
+        """
+        attempts = self.progress.list_attempts(user_id, limit=1_000_000)
+
+        exams_agg: dict[str, dict[str, Any]] = {}
+        lessons_agg: dict[str, dict[str, Any]] = {}
+        for a in sorted(attempts, key=lambda x: str(x.get("submitted_at", ""))):
+            scope = a.get("scope") or {}
+            score = a.get("score") or {}
+            if scope.get("type") == "exam" and scope.get("exam_id"):
+                key = exam_key(scope.get("course_id", ""), scope["exam_id"])
+                ep = exams_agg.setdefault(
+                    key, {"attempts": 0, "best_percent": 0.0, "passed": False})
+                ep["attempts"] += 1
+                ep["last_attempt_id"] = a.get("id")
+                ep["last_attempt_at"] = a.get("submitted_at")
+                st = score.get("status", "auto_graded")
+                ep["last_status"] = st
+                if st in ("auto_graded", "reviewed"):
+                    pct = score.get("percent")
+                    if pct is None:
+                        pct = score.get("final_percent") or score.get("provisional_percent") or 0.0
+                    ep["best_percent"] = max(ep.get("best_percent", 0.0), pct or 0.0)
+                    ep["passed"] = bool(ep.get("passed") or score.get("passed"))
+            elif scope.get("type") == "lesson" and scope.get("lesson_id"):
+                key = lesson_key(scope.get("course_id", ""), scope.get("module_id", ""),
+                                 scope["lesson_id"])
+                la = lessons_agg.setdefault(
+                    key, {"mastered": set(), "reviewed": set(), "attempts": 0,
+                          "best_accuracy": 0.0})
+                la["attempts"] += 1
+                for r in a.get("results", []):
+                    rs = r.get("review_status")
+                    if rs == "pending" or (r.get("type") == "free_text" and r.get("submitted")):
+                        la["reviewed"].add(r.get("exercise_id"))
+                    elif r.get("correct") is True:
+                        la["mastered"].add(r.get("exercise_id"))
+                    ratio = (r.get("points_earned") or 0) / (r.get("points_total") or 1)
+                    if r.get("correct") is not None:
+                        la["best_accuracy"] = max(la["best_accuracy"], ratio)
+
+        def _mut(prog: dict[str, Any]) -> dict[str, Any]:
+            # exámenes: agregados 100% derivados -> se reemplazan
+            prog["exams"] = {k: dict(v) for k, v in exams_agg.items()}
+            # lecciones: se conservan flags no derivados (teoría/ejemplos)
+            lessons = prog.setdefault("lessons", {})
+            for key, la in lessons_agg.items():
+                lp = lessons.get(key)
+                course_id, module_id, lesson_id = key.split(":", 2)
+                try:
+                    lesson = self.content.get_lesson(course_id, module_id, lesson_id)
+                except NotFoundError:
+                    continue
+                if lp is None:
+                    lp = self._empty_lesson_progress(lesson)
+                lp["mastered_exercises"] = sorted(x for x in la["mastered"] if x)
+                lp["reviewed_exercises"] = sorted(x for x in la["reviewed"] if x)
+                lp["exercises_mastered"] = len(lp["mastered_exercises"])
+                lp["exercises_reviewed"] = len(lp["reviewed_exercises"])
+                lp["attempts"] = la["attempts"]
+                lp["best_accuracy"] = la["best_accuracy"]
+                self._sync_lesson_totals(lp, lesson)
+                self._recompute_lesson_status(lp)
+                lessons[key] = lp
+            return {"exams": len(exams_agg), "lessons": len(lessons_agg)}
+
+        return self.progress.mutate_progress(user_id, _mut)
 
     # ------------------------------------------------------------------
     # Reportes / historial

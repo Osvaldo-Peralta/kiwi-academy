@@ -8,8 +8,19 @@ una variable de entorno.
 Diseño portable:
 - SQL estándar, JSON como TEXT (funciona idéntico en SQLite y Postgres).
 - Placeholders `?` -> se traducen a `%s` solo para psycopg.
-- Conexión por operación: patrón correcto en serverless (Vercel) y simple
-  en local; pooling queda para cuando haga falta.
+- Conexión por operación fuera de transacciones; dentro de `transaction()`
+  todas las operaciones del hilo comparten UNA conexión y UNA transacción.
+
+Iteración 3 — atomicidad:
+- transaction(user_id): Postgres = BEGIN + placeholder-row + SELECT…FOR
+  UPDATE sobre kiwi_progress (bloqueo de fila; serializa mutaciones del
+  usuario); SQLite = BEGIN IMMEDIATE (lock de escritura con busy-timeout).
+  Excepción => ROLLBACK completo: cero estados parciales.
+- mutate_progress: read-modify-write atómico bajo transaction().
+- save_report: guarda de propiedad — nunca sobrescribe/reasigna un reporte
+  de otro usuario (devuelve None si se intenta).
+- update_attempt / update_attempt_if_status: guards de propiedad en el
+  WHERE; el CAS funciona dentro o fuera de una transacción externa.
 
 Supabase: usa la URI de Settings -> Database. Con el pooler (puerto 6543,
 modo transaction) funciona bien en serverless; en local puedes usar el
@@ -19,8 +30,10 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Iterator, Optional
 
 from .base import ProgressStore
 
@@ -54,6 +67,10 @@ SCHEMA = [
 ]
 
 
+def _empty_progress(user_id: str) -> dict[str, Any]:
+    return {"user_id": user_id, "lessons": {}, "exams": {}, "activity": {}}
+
+
 class SqlProgressStore(ProgressStore):
     """ProgressStore sobre Postgres (psycopg) o SQLite (stdlib)."""
 
@@ -69,10 +86,11 @@ class SqlProgressStore(ProgressStore):
                 "KIWI_DATABASE_URL debe ser postgresql://... o sqlite:///ruta.db "
                 f"(recibido: {self.url[:40]}...)"
             )
+        self._local = threading.local()   # conexión de la transacción en curso
         self._ensure_schema()
 
     # ------------------------------------------------------------------
-    # plumbing de driver
+    # plumbing de driver (tx-aware)
     # ------------------------------------------------------------------
 
     def _connect(self):
@@ -86,7 +104,7 @@ class SqlProgressStore(ProgressStore):
                 ) from exc
             url = self.url.replace("postgres://", "postgresql://", 1)
             return psycopg.connect(url, connect_timeout=10)
-        conn = sqlite3.connect(self.sqlite_path, timeout=15)
+        conn = sqlite3.connect(self.sqlite_path, timeout=30)
         conn.execute("PRAGMA journal_mode=WAL")
         return conn
 
@@ -94,22 +112,109 @@ class SqlProgressStore(ProgressStore):
         """Traduce placeholders `?` al estilo del driver."""
         return sql.replace("?", "%s") if self.is_postgres else sql
 
+    def _tx_conn(self):
+        return getattr(self._local, "conn", None)
+
     def _execute(self, statements: list[tuple[str, tuple]]) -> list[list[Any]]:
-        """Ejecuta (sql, params) en una conexión; devuelve filas por sentencia."""
-        conn = self._connect()
+        """Ejecuta (sql, params); si hay transacción activa del hilo, la usa."""
+        tx = self._tx_conn()
+        conn = tx or self._connect()
         try:
             cur = conn.cursor()
             out = []
             for sql, params in statements:
                 cur.execute(self._sql(sql), params)
                 out.append(cur.fetchall() if cur.description else [])
-            conn.commit()
+            if tx is None:
+                conn.commit()
             return out
         finally:
-            conn.close()
+            if tx is None:
+                conn.close()
+
+    def _write(self, sql: str, params: tuple) -> int:
+        """Una escritura; devuelve rowcount. Tx-aware."""
+        tx = self._tx_conn()
+        conn = tx or self._connect()
+        try:
+            cur = conn.cursor()
+            cur.execute(self._sql(sql), params)
+            rc = cur.rowcount
+            if tx is None:
+                conn.commit()
+            return rc
+        finally:
+            if tx is None:
+                conn.close()
 
     def _ensure_schema(self) -> None:
         self._execute([(sql, ()) for sql in SCHEMA])
+
+    # ------------------------------------------------------------------
+    # Iteración 3: transacciones
+    # ------------------------------------------------------------------
+
+    @contextmanager
+    def transaction(self, user_id: str) -> Iterator[None]:
+        if self._tx_conn() is not None:
+            yield            # anidada: se une a la transacción externa
+            return
+
+        if self.is_postgres:
+            conn = self._connect()
+            try:
+                cur = conn.cursor()
+                # La fila debe existir para que FOR UPDATE la bloquee:
+                # placeholder inocuo si el usuario aún no tiene progreso.
+                cur.execute(
+                    self._sql(
+                        "INSERT INTO kiwi_progress (user_id, data, updated_at) "
+                        "VALUES (?, ?, ?) ON CONFLICT (user_id) DO NOTHING"
+                    ),
+                    (user_id, json.dumps(_empty_progress(user_id)), ""),
+                )
+                cur.execute(
+                    self._sql("SELECT data FROM kiwi_progress WHERE user_id = ? FOR UPDATE"),
+                    (user_id,),
+                )
+                self._local.conn = conn
+                yield
+                conn.commit()
+            except BaseException:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise
+            finally:
+                self._local.conn = None
+                conn.close()
+        else:
+            # SQLite: autocommit manual; BEGIN IMMEDIATE toma el lock de
+            # escritura al inicio (busy-timeout 30 s reintentando).
+            conn = sqlite3.connect(self.sqlite_path, timeout=30, isolation_level=None)
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("BEGIN IMMEDIATE")
+                self._local.conn = conn
+                yield
+                conn.execute("COMMIT")
+            except BaseException:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+            finally:
+                self._local.conn = None
+                conn.close()
+
+    def mutate_progress(self, user_id: str, fn: Callable[[dict[str, Any]], Any]) -> Any:
+        with self.transaction(user_id):
+            prog = self.load_progress(user_id)
+            out = fn(prog)
+            self.save_progress(user_id, prog)
+            return out
 
     # ------------------------------------------------------------------
     # progreso
@@ -120,7 +225,7 @@ class SqlProgressStore(ProgressStore):
             ("SELECT data FROM kiwi_progress WHERE user_id = ?", (user_id,)),
         ])[0]
         if not rows:
-            return {"user_id": user_id, "lessons": {}, "exams": {}, "activity": {}}
+            return _empty_progress(user_id)
         return json.loads(rows[0][0])
 
     def save_progress(self, user_id: str, progress: dict[str, Any]) -> None:
@@ -156,31 +261,39 @@ class SqlProgressStore(ProgressStore):
         data = json.dumps(attempt, ensure_ascii=False)
         submitted = str(attempt.get("submitted_at", ""))
         sql = "UPDATE kiwi_attempts SET data = ?, submitted_at = ? WHERE id = ? AND user_id = ?"
-        conn = self._connect()
+        return self._write(sql, (data, submitted, attempt["id"], user_id)) > 0
+
+    @staticmethod
+    def _status_of(raw: str) -> Optional[str]:
         try:
-            cur = conn.cursor()
-            cur.execute(self._sql(sql), (data, submitted, attempt["id"], user_id))
-            conn.commit()
-            return cur.rowcount > 0
-        finally:
-            conn.close()
+            return (json.loads(raw).get("score") or {}).get("status")
+        except (ValueError, AttributeError):
+            return None
 
     def update_attempt_if_status(
         self, user_id: str, attempt_id: str,
         expected_status: str, attempt: dict[str, Any],
     ) -> bool:
-        """CAS atómico: la transición de estado ocurre dentro de UNA
-        transacción con bloqueo (Postgres: SELECT … FOR UPDATE; SQLite:
-        BEGIN IMMEDIATE). Revisiones concurrentes se serializan: la primera
-        gana y la segunda observa el estado nuevo y devuelve False."""
+        """CAS atómico pending->reviewed. Dentro de una transacción externa
+        reutiliza su conexión y bloqueos; fuera, abre la suya propia."""
         data = json.dumps(attempt, ensure_ascii=False)
         submitted = str(attempt.get("submitted_at", ""))
+        tx = self._tx_conn()
 
-        def _status_of(raw: str) -> Optional[str]:
-            try:
-                return (json.loads(raw).get("score") or {}).get("status")
-            except (ValueError, AttributeError):
-                return None
+        if tx is not None:
+            cur = tx.cursor()
+            cur.execute(
+                self._sql("SELECT data FROM kiwi_attempts WHERE id = ? AND user_id = ?"),
+                (attempt_id, user_id),
+            )
+            row = cur.fetchone()
+            if not row or self._status_of(row[0]) != expected_status:
+                return False
+            cur.execute(
+                self._sql("UPDATE kiwi_attempts SET data = ?, submitted_at = ? WHERE id = ? AND user_id = ?"),
+                (data, submitted, attempt_id, user_id),
+            )
+            return True
 
         if self.is_postgres:
             conn = self._connect()
@@ -191,7 +304,7 @@ class SqlProgressStore(ProgressStore):
                     (attempt_id, user_id),
                 )
                 row = cur.fetchone()
-                if not row or _status_of(row[0]) != expected_status:
+                if not row or self._status_of(row[0]) != expected_status:
                     conn.rollback()
                     return False
                 cur.execute(
@@ -209,8 +322,7 @@ class SqlProgressStore(ProgressStore):
             finally:
                 conn.close()
 
-        # SQLite: autocommit manual para controlar BEGIN IMMEDIATE
-        conn = sqlite3.connect(self.sqlite_path, timeout=15, isolation_level=None)
+        conn = sqlite3.connect(self.sqlite_path, timeout=30, isolation_level=None)
         cur = conn.cursor()
         try:
             cur.execute("BEGIN IMMEDIATE")
@@ -219,7 +331,7 @@ class SqlProgressStore(ProgressStore):
                 (attempt_id, user_id),
             )
             row = cur.fetchone()
-            if not row or _status_of(row[0]) != expected_status:
+            if not row or self._status_of(row[0]) != expected_status:
                 cur.execute("ROLLBACK")
                 return False
             cur.execute(
@@ -260,17 +372,59 @@ class SqlProgressStore(ProgressStore):
         return [json.loads(r[0]) for r in rows]
 
     # ------------------------------------------------------------------
-    # reportes
+    # reportes (con guarda de propiedad — Iteración 3)
     # ------------------------------------------------------------------
 
-    def save_report(self, user_id: str, attempt_id: str, name: str, content: str) -> str:
-        if self.is_postgres:
-            sql = (
-                "INSERT INTO kiwi_reports (attempt_id, name, user_id, content) VALUES (?, ?, ?, ?) "
-                "ON CONFLICT (attempt_id, name) DO UPDATE SET content = EXCLUDED.content, "
-                "user_id = EXCLUDED.user_id"
+    def save_report(self, user_id: str, attempt_id: str, name: str, content: str) -> Optional[str]:
+        """Guarda/actualiza el reporte SOLO si no existe o pertenece al mismo
+        usuario. Un reporte ajeno jamás se sobrescribe ni se reasigna:
+        devuelve None (denegado) sin efectos."""
+        tx = self._tx_conn()
+        conn = tx or self._connect()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                self._sql("SELECT user_id FROM kiwi_reports WHERE attempt_id = ? AND name = ?"),
+                (attempt_id, name),
             )
-        else:
-            sql = "INSERT OR REPLACE INTO kiwi_reports (attempt_id, name, user_id, content) VALUES (?, ?, ?, ?)"
-        self._execute([(sql, (attempt_id, name, user_id, content))])
-        return f"sql://{attempt_id}/{name}"
+            row = cur.fetchone()
+            if row and row[0] != user_id:
+                if tx is None:
+                    conn.rollback()
+                return None    # intento de usurpación de propiedad: denegado
+            if row:
+                cur.execute(
+                    self._sql("UPDATE kiwi_reports SET content = ? WHERE attempt_id = ? AND name = ? AND user_id = ?"),
+                    (content, attempt_id, name, user_id),
+                )
+            else:
+                if self.is_postgres:
+                    # INSERT .. ON CONFLICT DO NOTHING: si otra transacción lo
+                    # creó entre el SELECT y el INSERT, no se pisa al dueño.
+                    cur.execute(
+                        self._sql(
+                            "INSERT INTO kiwi_reports (attempt_id, name, user_id, content) "
+                            "VALUES (?, ?, ?, ?) ON CONFLICT (attempt_id, name) DO NOTHING"
+                        ),
+                        (attempt_id, name, user_id, content),
+                    )
+                    if cur.rowcount == 0:
+                        if tx is None:
+                            conn.rollback()
+                        return None
+                else:
+                    cur.execute(
+                        "INSERT OR IGNORE INTO kiwi_reports (attempt_id, name, user_id, content) "
+                        "VALUES (?, ?, ?, ?)",
+                        (attempt_id, name, user_id, content),
+                    )
+                    if cur.rowcount == 0:
+                        if tx is None:
+                            conn.rollback()
+                        return None
+            if tx is None:
+                conn.commit()
+            return f"sql://{attempt_id}/{name}"
+        finally:
+            if tx is None:
+                conn.close()
