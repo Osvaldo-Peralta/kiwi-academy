@@ -23,7 +23,11 @@ from backend.app.core.auth import TEST_JWT_SECRET, reset_verifier
 from backend.app.core.services import LearningService, exam_key, lesson_key
 from backend.app.main import app
 from backend.app.api.v1.deps import get_service
-from backend.app.storage.json_store import JsonProgressStore, TransactionRollbackError
+from backend.app.storage.json_store import (
+    JsonProgressStore,
+    StoreDegradedError,
+    TransactionRollbackError,
+)
 from backend.app.storage.repositories import ContentRepository, ProgressRepository
 from backend.app.storage.sql_store import SqlProgressStore
 
@@ -613,8 +617,9 @@ def test_caso_c_varios_archivos_restaurables_y_fallidos(tmp_path, monkeypatch):
     assert {p for p, _ in store.rollback_failures[0]["failures"]} == failed_paths
 
 
-# ── Caso D: estado transaccional definido tras rollback fallido ──────────
-def test_caso_d_estado_transaccional_definido_y_sin_diario_obsoleto(tmp_path, monkeypatch):
+# ── Caso D (actualizado por auditoría): store DEGRADADO tras rollback
+#    incompleto -> escrituras rechazadas hasta recuperación verificada ──────
+def test_caso_d_store_degradado_bloquea_hasta_recuperacion_verificada(tmp_path, monkeypatch):
     store = JsonProgressStore(root=tmp_path)
     store.save_progress("dev-u", _base_prog(v=1))
 
@@ -633,26 +638,84 @@ def test_caso_d_estado_transaccional_definido_y_sin_diario_obsoleto(tmp_path, mo
             store.save_progress("dev-u", _base_prog(v=2))
             store.save_report("dev-u", "att_d", "report.md", "x")
 
-    # 1) estado local DEFINIDO: diario limpio pese al fallo de restauración
+    # 1) estado transaccional definido Y store marcado como degradado
     assert getattr(store._local, "journal", None) is None
+    assert store.degraded is not None
+    assert store.degraded["user_id"] == "dev-u"
     assert len(store.rollback_failures) == 1
 
-    # 2) el store sigue utilizable: sanear el FS y operar de nuevo
+    # 2) mientras está degradado: TODA escritura transaccional se rechaza
+    with pytest.raises(StoreDegradedError):
+        with store.transaction("dev-u"):
+            store.save_progress("dev-u", _base_prog(v=99))
+    with pytest.raises(StoreDegradedError):
+        store.mutate_progress("dev-u", lambda prog: prog.update(v=99))
+    assert store.load_progress("dev-u")["v"] == 2        # nada fue escrito
+    # las lecturas siguen disponibles para diagnosticar
+    assert store.list_attempts("dev-u") is not None
+
+    # 3) recuperación NO satisfactoria: si el archivo pendiente queda
+    #    corrupto, verify_recovery lo detecta y el store SIGUE degradado
+    prog_path = store.root / "dev-u" / "progress.json"
+    prog_path.write_text("{ json roto a propósito", encoding="utf-8")
+    ok, problems = store.verify_recovery()
+    assert ok is False
+    assert any("progress.json" in pr["path"] for pr in problems)
+    assert store.degraded is not None
+    with pytest.raises(StoreDegradedError):
+        with store.transaction("dev-u"):
+            pass
+
+    # 4) recuperación satisfactoria: el operador restaura el archivo
+    #    (aquí, desde el .rbak conservado como material de recuperación)
     proxy.fail_replace = False
-    prog_tx2 = dict(_base_prog(v=3), marker="tx2")
+    rbak = store.root / "dev-u" / "progress.json.rbak"
+    assert rbak.exists(), "el .rbak se conserva como material de recuperación"
+    prog_path.write_bytes(rbak.read_bytes())             # contenido original (v1)
+    ok, problems = store.verify_recovery()
+    assert ok is True and problems == []
+    assert store.degraded is None                        # escrituras reanudadas
+
+    # 5) tras la recuperación: el store opera con diario fresco (sin mezcla
+    #    con la transacción fallida) y el rollback exitoso sigue funcionando
     with store.transaction("dev-u"):
-        store.save_progress("dev-u", prog_tx2)
+        store.save_progress("dev-u", dict(_base_prog(v=3), marker="tx2"))
     assert store.load_progress("dev-u")["marker"] == "tx2"
 
-    # 3) nueva transacción fallida con rollback EXITOSO: restaura al estado
-    #    inmediatamente anterior (tx2) — el diario es fresco, no se mezcla
-    #    con el de la transacción fallida anterior
     with pytest.raises(ValueError):
         with store.transaction("dev-u"):
-            store.save_progress("dev-u", dict(prog_tx2, marker="tx3"))
+            store.save_progress("dev-u", dict(_base_prog(v=3), marker="tx3"))
             raise ValueError("fallo nuevo controlado")
     prog = store.load_progress("dev-u")
-    assert prog["marker"] == "tx2" and prog["v"] == 3
-    # 4) sin nuevos fallos de rollback; diario nuevamente limpio
-    assert len(store.rollback_failures) == 1
+    assert prog["marker"] == "tx2" and prog["v"] == 3    # restauró a SU pre-estado
+    assert len(store.rollback_failures) == 1             # sin fallos nuevos
     assert getattr(store._local, "journal", None) is None
+
+    # 6) vía documentada alternativa: una instancia nueva (tras reparar los
+    #    archivos) no hereda el estado degradado (es estado de instancia)
+    store2 = JsonProgressStore(root=tmp_path)
+    assert store2.degraded is None
+
+
+def test_store_degradado_rechaza_escrituras_del_servicio(tmp_path):
+    """Regresión a nivel de servicio: con el store degradado, los flujos de
+    negocio que escriben (marcar progreso, iniciar sesión de examen) se
+    rechazan con StoreDegradedError; tras verify_recovery se reanudan."""
+    store = make_store("json", tmp_path)
+    service = make_service(store)
+    store._degraded = {
+        "when": "2026-10-24T00:00:00+00:00", "user_id": "dev-student",
+        "original": "RuntimeError: simulado", "restored": [],
+        "failures": [("ruta", "OSError: simulado")], "checks": [],
+    }
+    with pytest.raises(StoreDegradedError):
+        service.mark_lesson_progress("dev-student", COURSE, MOD1, LESSON1,
+                                     theory_completed=True)
+    with pytest.raises(StoreDegradedError):
+        service.start_exam_session("dev-student", COURSE, EXAM)
+
+    ok, problems = store.verify_recovery()      # checks vacíos (simulado)
+    assert ok is True and problems == []
+    lp = service.mark_lesson_progress("dev-student", COURSE, MOD1, LESSON1,
+                                      theory_completed=True)
+    assert lp["theory_completed"] is True       # servicio reanudado

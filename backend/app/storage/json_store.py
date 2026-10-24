@@ -41,6 +41,14 @@ class TransactionRollbackError(RuntimeError):
     Los archivos temporales `.rbak` de restauraciones fallidas se conservan
     en disco como evidencia forense y material de recuperación manual.
 
+    Consecuencia (corrección de auditoría): el store queda marcado como
+    DEGRADADO y rechaza nuevas escrituras transaccionales
+    (`StoreDegradedError`) hasta una recuperación explícita y verificada
+    (`JsonProgressStore.verify_recovery()`) o la reconstrucción de la
+    instancia tras reparar los archivos. La finalidad no es garantizar la
+    recuperación ante cualquier fallo físico, sino impedir que el sistema
+    siga escribiendo como si estuviera íntegro.
+
     LIMITACIÓN RESIDUAL (documentada): el rollback basado en archivos no puede
     garantizar la recuperación completa ante cualquier fallo del sistema
     operativo o del almacenamiento (p. ej. disco lleno, permisos revocados,
@@ -62,6 +70,27 @@ class TransactionRollbackError(RuntimeError):
             f"puede ser inconsistente: NO se asuma recuperado; diagnostique "
             f"(rollback_failures / logs) y considere tools/repair_progress.py."
         )
+
+class StoreDegradedError(RuntimeError):
+    """El store JSON está DEGRADADO: un rollback anterior quedó incompleto y
+    los datos pueden ser inconsistentes. Se rechazan nuevas escrituras
+    transaccionales hasta:
+      (a) ejecutar `JsonProgressStore.verify_recovery()` con resultado
+          satisfactorio (procedimiento explícito y verificable), o
+      (b) reconstruir una instancia del store después de recuperar los
+          archivos (p. ej. restaurando desde los `.rbak` conservados y/o
+          usando tools/repair_progress.py).
+    Las operaciones de LECTURA no se bloquean (necesarias para diagnosticar)."""
+
+    def __init__(self, degraded_info: dict):
+        self.degraded = degraded_info
+        super().__init__(
+            "JsonProgressStore DEGRADADO (rollback incompleto previo): "
+            "escrituras transaccionales rechazadas hasta recuperación "
+            "verificada (verify_recovery) o reconstrucción de la instancia. "
+            "Detalles: " + json.dumps(degraded_info, ensure_ascii=False, default=str)[:600]
+        )
+
 
 _LOCKS: dict[str, threading.RLock] = {}
 _LOCKS_GUARD = threading.Lock()
@@ -197,6 +226,16 @@ class JsonProgressStore(ProgressStore):
         # Evidencia en memoria de rollbacks incompletos (diagnóstico):
         # [{when, user_id, original, restored, failures}, ...]
         self.rollback_failures: list[dict[str, Any]] = []
+        # Estado degradado activo (None = store íntegro/operativo). Se marca
+        # cuando un rollback queda incompleto; se limpia SOLO mediante
+        # verify_recovery() satisfactorio (o creando una instancia nueva tras
+        # reparar los archivos).
+        self._degraded: Optional[dict[str, Any]] = None
+
+    @property
+    def degraded(self) -> Optional[dict[str, Any]]:
+        """Registro del estado degradado vigente, o None si el store está íntegro."""
+        return self._degraded
 
     # -- diario copy-on-write (rollback real en operaciones compuestas) ------
 
@@ -340,6 +379,10 @@ class JsonProgressStore(ProgressStore):
         original (o se borran si no existían). El store JSON es
         single-proceso por diseño; la garantía multi-worker la da el SQL."""
         with _STORE_LOCK:
+            # Corrección de auditoría: un store degradado NO admite nuevas
+            # escrituras transaccionales hasta recuperación verificada.
+            if self._degraded is not None:
+                raise StoreDegradedError(self._degraded)
             if getattr(self._local, "journal", None) is not None:
                 yield          # anidada: se une a la transacción externa
                 return
@@ -356,14 +399,27 @@ class JsonProgressStore(ProgressStore):
                 if failures:
                     # La operación original falló Y la recuperación quedó
                     # incompleta: se comunica explícitamente conservando
-                    # ambas evidencias (excepción encadenada + registro).
-                    self.rollback_failures.append({
+                    # ambas evidencias (excepción encadenada + registro) y se
+                    # marca el store como DEGRADADO (rechaza nuevas escrituras
+                    # transaccionales hasta verify_recovery()).
+                    record = {
                         "when": datetime.now(timezone.utc).isoformat(),
                         "user_id": user_id,
                         "original": f"{type(exc).__name__}: {exc}",
                         "restored": restored,
                         "failures": failures,
-                    })
+                        # estado esperado de cada archivo no restaurado, para
+                        # la verificación de recuperación:
+                        #   "absent" -> el rollback debió borrarlo (era nuevo)
+                        #   "json"   -> debe existir y parsear como JSON
+                        "checks": [
+                            {"path": p,
+                             "expect": "json" if journal.get(p) is not None else "absent"}
+                            for p, _ in failures
+                        ],
+                    }
+                    self.rollback_failures.append(record)
+                    self._degraded = record
                     log.error(
                         "Rollback JSON INCOMPLETO (user=%s): %d archivo(s) no "
                         "restaurado(s); estado potencialmente inconsistente. "
@@ -377,7 +433,66 @@ class JsonProgressStore(ProgressStore):
 
     def mutate_progress(self, user_id: str, fn: Callable[[dict[str, Any]], Any]) -> Any:
         with _STORE_LOCK:
+            # misma guarda que transaction(): un store degradado no escribe
+            if self._degraded is not None:
+                raise StoreDegradedError(self._degraded)
             prog = self.load_progress(user_id)
             out = fn(prog)
             self.save_progress(user_id, prog)
             return out
+
+    # -- recuperación explícita y verificable del estado degradado ------------
+
+    def verify_recovery(self) -> tuple[bool, list[dict[str, Any]]]:
+        """Procedimiento explícito de recuperación (corrección de auditoría).
+
+        Verifica cada archivo pendiente del registro de degradación contra el
+        estado esperado:
+          - expect "absent": no debe existir (el rollback no pudo borrarlo;
+            el operador debe eliminarlo tras revisarlo).
+          - expect "json": debe existir y parsear como JSON (restaurarlo,
+            p. ej. desde el `.rbak` conservado, o reparar los agregados con
+            tools/repair_progress.py — los intentos son la fuente de verdad).
+
+        Si TODAS las comprobaciones pasan: limpia el estado degradado (el
+        store vuelve a aceptar escrituras transaccionales) y devuelve
+        (True, []). Si alguna falla: el store SIGUE degradado y devuelve
+        (False, problemas). No borra los `.rbak` (evidencia/material de
+        recuperación). Alternativa documentada: reconstruir una instancia
+        nueva del store después de reparar los archivos.
+        """
+        with _STORE_LOCK:
+            if self._degraded is None:
+                return True, []
+            problems: list[dict[str, Any]] = []
+            for chk in self._degraded.get("checks", []):
+                path = Path(chk["path"])
+                if chk["expect"] == "absent":
+                    if path.exists():
+                        problems.append({
+                            "path": chk["path"],
+                            "problem": "sigue existiendo; el rollback no pudo eliminarlo "
+                                       "(revíselo y elimínelo manualmente)",
+                        })
+                else:
+                    if not path.exists():
+                        problems.append({
+                            "path": chk["path"],
+                            "problem": "no existe; restáurelo (p. ej. desde el .rbak)",
+                        })
+                    else:
+                        try:
+                            json.loads(path.read_text(encoding="utf-8"))
+                        except (OSError, ValueError) as exc:
+                            problems.append({
+                                "path": chk["path"],
+                                "problem": f"no es JSON válido: {type(exc).__name__}: {exc}",
+                            })
+            if problems:
+                log.error("verify_recovery: recuperación NO satisfactoria; el store "
+                          "SIGUE degradado. Problemas: %s", problems)
+                return False, problems
+            log.warning("verify_recovery: recuperación verificada; el store sale "
+                        "del estado degradado y reanuda las escrituras")
+            self._degraded = None
+            return True, []
