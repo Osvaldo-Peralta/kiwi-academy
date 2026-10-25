@@ -126,8 +126,12 @@ class ProgressStore(ABC):
           el store queda DEGRADADO: rechaza TODAS sus operaciones públicas
           de escritura —transaccionales y directas— (`StoreDegradedError`,
           comprobación centralizada) hasta una recuperación explícita y
-          verificada (`verify_recovery()`) o la reconstrucción de la
-          instancia tras reparar los archivos.
+          verificada: `verify_recovery()` (restauración EXACTA, comprobada
+          byte a byte contra el sha256 original registrado antes del
+          rollback) o `verify_semantic_recovery(validator)` (ruta explícita
+          para reparaciones con contenido legítimamente distinto, acreditada
+          por un validador), o la reconstrucción de la instancia tras
+          reparar los archivos.
 
         Anidable: una transacción interna se une a la externa.
         """

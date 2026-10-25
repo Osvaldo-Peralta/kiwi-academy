@@ -706,7 +706,21 @@ class LearningService:
 
         Uso: recuperación tras estado parcial (store JSON/crash) y herramienta
         de consistencia (tools/repair_progress.py). Idempotente.
+
+        Contrapartes de solo lectura (corrección de auditoría PR #4, store
+        degradado): `compute_repaired_progress` (calcula el progreso reparado
+        SIN escribir) y `validate_progress_repair` (acredita que el progreso
+        en disco es consistente con los intentos; se usa como validador de la
+        ruta explícita de recuperación semántica del store,
+        `verify_semantic_recovery`).
         """
+        return self.progress.mutate_progress(
+            user_id, lambda prog: self._apply_rebuilt_aggregates(user_id, prog))
+
+    def _apply_rebuilt_aggregates(self, user_id: str, prog: dict[str, Any]) -> dict[str, Any]:
+        """Reconstruye los agregados derivados desde los intentos y los aplica
+        IN PLACE sobre `prog` (sin escribir en el store). Devuelve el resumen
+        {"exams": n, "lessons": m}."""
         attempts = self.progress.list_attempts(user_id, limit=1_000_000)
 
         exams_agg: dict[str, dict[str, Any]] = {}
@@ -746,32 +760,67 @@ class LearningService:
                     if r.get("correct") is not None:
                         la["best_accuracy"] = max(la["best_accuracy"], ratio)
 
-        def _mut(prog: dict[str, Any]) -> dict[str, Any]:
-            # exámenes: agregados 100% derivados -> se reemplazan
-            prog["exams"] = {k: dict(v) for k, v in exams_agg.items()}
-            # lecciones: se conservan flags no derivados (teoría/ejemplos)
-            lessons = prog.setdefault("lessons", {})
-            for key, la in lessons_agg.items():
-                lp = lessons.get(key)
-                course_id, module_id, lesson_id = key.split(":", 2)
-                try:
-                    lesson = self.content.get_lesson(course_id, module_id, lesson_id)
-                except NotFoundError:
-                    continue
-                if lp is None:
-                    lp = self._empty_lesson_progress(lesson)
-                lp["mastered_exercises"] = sorted(x for x in la["mastered"] if x)
-                lp["reviewed_exercises"] = sorted(x for x in la["reviewed"] if x)
-                lp["exercises_mastered"] = len(lp["mastered_exercises"])
-                lp["exercises_reviewed"] = len(lp["reviewed_exercises"])
-                lp["attempts"] = la["attempts"]
-                lp["best_accuracy"] = la["best_accuracy"]
-                self._sync_lesson_totals(lp, lesson)
-                self._recompute_lesson_status(lp)
-                lessons[key] = lp
-            return {"exams": len(exams_agg), "lessons": len(lessons_agg)}
+        # exámenes: agregados 100% derivados -> se reemplazan
+        prog["exams"] = {k: dict(v) for k, v in exams_agg.items()}
+        # lecciones: se conservan flags no derivados (teoría/ejemplos)
+        lessons = prog.setdefault("lessons", {})
+        for key, la in lessons_agg.items():
+            lp = lessons.get(key)
+            course_id, module_id, lesson_id = key.split(":", 2)
+            try:
+                lesson = self.content.get_lesson(course_id, module_id, lesson_id)
+            except NotFoundError:
+                continue
+            if lp is None:
+                lp = self._empty_lesson_progress(lesson)
+            lp["mastered_exercises"] = sorted(x for x in la["mastered"] if x)
+            lp["reviewed_exercises"] = sorted(x for x in la["reviewed"] if x)
+            lp["exercises_mastered"] = len(lp["mastered_exercises"])
+            lp["exercises_reviewed"] = len(lp["reviewed_exercises"])
+            lp["attempts"] = la["attempts"]
+            lp["best_accuracy"] = la["best_accuracy"]
+            self._sync_lesson_totals(lp, lesson)
+            self._recompute_lesson_status(lp)
+            lessons[key] = lp
+        return {"exams": len(exams_agg), "lessons": len(lessons_agg)}
 
-        return self.progress.mutate_progress(user_id, _mut)
+    def compute_repaired_progress(self, user_id: str) -> dict[str, Any]:
+        """Calcula (SOLO LECTURA, sin escribir) el dict de progreso tal como
+        debería quedar tras reconstruir los agregados derivados desde los
+        intentos.
+
+        Motivación (corrección de auditoría PR #4): un store JSON degradado
+        rechaza TODA escritura vía API (`StoreDegradedError`), incluido este
+        rebuild. La reparación a nivel de archivo —equivalente a lo que hace
+        tools/repair_progress.py sobre una instancia no degradada— puede
+        usar este método para obtener el contenido reparado, escribirlo
+        directamente y acreditarlo después con la ruta explícita de
+        recuperación semántica del store:
+        `store.verify_semantic_recovery(
+            lambda s: service.validate_progress_repair(user_id)[0])`."""
+        prog = self.progress.get_progress(user_id)
+        self._apply_rebuilt_aggregates(user_id, prog)
+        return prog
+
+    def validate_progress_repair(self, user_id: str) -> tuple[bool, dict[str, Any]]:
+        """Valida (SOLO LECTURA) una reparación: el progreso actual en disco
+        debe ser IGUAL a la reconstrucción desde el historial de intentos
+        (los intentos son la fuente de verdad; los agregados, datos
+        derivados).
+
+        Destinado a servir de validador en la ruta explícita de recuperación
+        semántica del store (`JsonProgressStore.verify_semantic_recovery`)
+        tras una reparación con contenido legítimamente distinto del
+        original (p. ej. tools/repair_progress.py). Devuelve (ok, detalle)."""
+        actual = self.progress.get_progress(user_id)
+        expected = self.compute_repaired_progress(user_id)
+        ok = actual == expected
+        detail: dict[str, Any] = {"consistent_with_attempts": ok}
+        if not ok:
+            detail["detalle"] = ("el progreso actual no coincide con la "
+                                 "reconstrucción desde los intentos "
+                                 "(reparación incompleta o agregados alterados)")
+        return ok, detail
 
     # ------------------------------------------------------------------
     # Reportes / historial
