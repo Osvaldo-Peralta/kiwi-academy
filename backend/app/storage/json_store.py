@@ -42,8 +42,11 @@ class TransactionRollbackError(RuntimeError):
     en disco como evidencia forense y material de recuperación manual.
 
     Consecuencia (corrección de auditoría): el store queda marcado como
-    DEGRADADO y rechaza nuevas escrituras transaccionales
-    (`StoreDegradedError`) hasta una recuperación explícita y verificada
+    DEGRADADO y rechaza TODAS sus operaciones públicas de escritura —
+    `transaction()`, `mutate_progress()`, `save_progress()`,
+    `save_attempt()`, `update_attempt()`, `update_attempt_if_status()` y
+    `save_report()` (comprobación centralizada `_ensure_not_degraded`) —
+    hasta una recuperación explícita y verificada
     (`JsonProgressStore.verify_recovery()`) o la reconstrucción de la
     instancia tras reparar los archivos. La finalidad no es garantizar la
     recuperación ante cualquier fallo físico, sino impedir que el sistema
@@ -73,8 +76,9 @@ class TransactionRollbackError(RuntimeError):
 
 class StoreDegradedError(RuntimeError):
     """El store JSON está DEGRADADO: un rollback anterior quedó incompleto y
-    los datos pueden ser inconsistentes. Se rechazan nuevas escrituras
-    transaccionales hasta:
+    los datos pueden ser inconsistentes. Se rechazan TODAS las operaciones
+    públicas de escritura (transaccionales y directas, vía la comprobación
+    centralizada `_ensure_not_degraded`) hasta:
       (a) ejecutar `JsonProgressStore.verify_recovery()` con resultado
           satisfactorio (procedimiento explícito y verificable), o
       (b) reconstruir una instancia del store después de recuperar los
@@ -237,6 +241,15 @@ class JsonProgressStore(ProgressStore):
         """Registro del estado degradado vigente, o None si el store está íntegro."""
         return self._degraded
 
+    def _ensure_not_degraded(self) -> None:
+        """Comprobación CENTRALIZADA (corrección final de auditoría): ningún
+        método público de escritura puede ejecutarse con el store degradado.
+        Se evalúa ANTES de cualquier modificación de datos. Lectura de un
+        único atributo: segura sin lock y no interfiere con la recuperación
+        (verify_recovery no escribe vía estos métodos)."""
+        if self._degraded is not None:
+            raise StoreDegradedError(self._degraded)
+
     # -- diario copy-on-write (rollback real en operaciones compuestas) ------
 
     def _record_original(self, path: Path) -> None:
@@ -288,6 +301,7 @@ class JsonProgressStore(ProgressStore):
         return data or {"user_id": user_id, "lessons": {}, "exams": {}, "activity": {}}
 
     def save_progress(self, user_id: str, progress: dict[str, Any]) -> None:
+        self._ensure_not_degraded()
         self._write_json_journaled(self._progress_path(user_id), progress)
 
     # -- intentos (append-only) ---------------------------------------------
@@ -298,9 +312,11 @@ class JsonProgressStore(ProgressStore):
         return d
 
     def save_attempt(self, user_id: str, attempt: dict[str, Any]) -> None:
+        self._ensure_not_degraded()
         self._write_json_journaled(self._attempts_dir(user_id) / f"{attempt['id']}.json", attempt)
 
     def update_attempt(self, user_id: str, attempt: dict[str, Any]) -> bool:
+        self._ensure_not_degraded()
         path = self._attempts_dir(user_id) / f"{attempt['id']}.json"
         if not path.exists():
             return False  # guarda de propiedad: solo actualiza lo existente
@@ -313,6 +329,7 @@ class JsonProgressStore(ProgressStore):
     ) -> bool:
         """CAS atómico en el proceso: lectura + comprobación + escritura bajo
         el mismo lock de ruta (RLock). Exactamente un hilo ganador."""
+        self._ensure_not_degraded()
         safe = "".join(c for c in attempt_id if c.isalnum() or c in "-_")
         path = self._attempts_dir(user_id) / f"{safe}.json"
         with _lock_for(str(path)):
@@ -356,6 +373,7 @@ class JsonProgressStore(ProgressStore):
         # usuario. Además (auditoría Iter 3, punto 3): solo se crea/actualiza
         # un reporte si el intento EXISTE y pertenece a este usuario — se
         # rechaza vincular reportes a intentos ajenos o inexistentes.
+        self._ensure_not_degraded()
         safe_attempt = "".join(c for c in attempt_id if c.isalnum() or c in "-_")
         att_path = self.root / user_id / "attempts" / f"{safe_attempt}.json"
         if not att_path.exists():
@@ -381,8 +399,7 @@ class JsonProgressStore(ProgressStore):
         with _STORE_LOCK:
             # Corrección de auditoría: un store degradado NO admite nuevas
             # escrituras transaccionales hasta recuperación verificada.
-            if self._degraded is not None:
-                raise StoreDegradedError(self._degraded)
+            self._ensure_not_degraded()
             if getattr(self._local, "journal", None) is not None:
                 yield          # anidada: se une a la transacción externa
                 return
@@ -433,9 +450,8 @@ class JsonProgressStore(ProgressStore):
 
     def mutate_progress(self, user_id: str, fn: Callable[[dict[str, Any]], Any]) -> Any:
         with _STORE_LOCK:
-            # misma guarda que transaction(): un store degradado no escribe
-            if self._degraded is not None:
-                raise StoreDegradedError(self._degraded)
+            # misma guarda centralizada que el resto de escrituras públicas
+            self._ensure_not_degraded()
             prog = self.load_progress(user_id)
             out = fn(prog)
             self.save_progress(user_id, prog)

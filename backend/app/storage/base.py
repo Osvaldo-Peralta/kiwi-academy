@@ -123,10 +123,11 @@ class ProgressStore(ABC):
           `json_store.TransactionRollbackError` (encadenada al error
           original, con detalle de archivos no restaurados): el fallo de
           recuperación NUNCA se silencia ni se presenta como recuperado, y
-          el store queda DEGRADADO: rechaza nuevas escrituras
-          transaccionales (`StoreDegradedError`) hasta una recuperación
-          explícita y verificada (`verify_recovery()`) o la reconstrucción
-          de la instancia tras reparar los archivos.
+          el store queda DEGRADADO: rechaza TODAS sus operaciones públicas
+          de escritura —transaccionales y directas— (`StoreDegradedError`,
+          comprobación centralizada) hasta una recuperación explícita y
+          verificada (`verify_recovery()`) o la reconstrucción de la
+          instancia tras reparar los archivos.
 
         Anidable: una transacción interna se une a la externa.
         """

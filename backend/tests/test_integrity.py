@@ -719,3 +719,95 @@ def test_store_degradado_rechaza_escrituras_del_servicio(tmp_path):
     lp = service.mark_lesson_progress("dev-student", COURSE, MOD1, LESSON1,
                                       theory_completed=True)
     assert lp["theory_completed"] is True       # servicio reanudado
+
+
+# ---------------------------------------------------------------------------
+# Corrección FINAL de auditoría: ninguna ruta pública de escritura elude el
+# estado degradado (comprobación centralizada _ensure_not_degraded)
+# ---------------------------------------------------------------------------
+
+def _degradar_store_real(store, monkeypatch):
+    """Provoca una degradación REAL (rollback incompleto) con la inyección
+    determinista habitual: proxy de os.replace + fallo original dentro de la
+    transacción (sin parchear métodos del store)."""
+    proxy = _OsProxy(_real_os)
+    monkeypatch.setattr(_jsmod, "os", proxy)
+    with pytest.raises(TransactionRollbackError):
+        with store.transaction("dev-u"):
+            store.save_attempt("dev-u", _att("att_degradado"))
+            store.save_progress("dev-u", _base_prog(v=2))
+            proxy.fail_replace = True     # la restauración fallará desde aquí
+            raise RuntimeError("fallo original")
+    assert store.degraded is not None
+    proxy.fail_replace = False            # "FS saneado": escrituras delegan al os real
+    return proxy
+
+
+def test_todas_las_rutas_publicas_de_escritura_rechazan_en_degradado(tmp_path, monkeypatch):
+    store = JsonProgressStore(root=tmp_path)
+    store.save_progress("dev-u", _base_prog(v=1))
+    store.save_attempt("dev-u", _att("att_pre"))       # intento preexistente
+
+    _degradar_store_real(store, monkeypatch)
+
+    # instantáneas de integridad (bytes) de los archivos existentes
+    prog_path = store.root / "dev-u" / "progress.json"
+    att_path = store.root / "dev-u" / "attempts" / "att_pre.json"
+    prog_bytes_antes = prog_path.read_bytes()
+    att_bytes_antes = att_path.read_bytes()
+
+    # 1) save_progress
+    with pytest.raises(StoreDegradedError):
+        store.save_progress("dev-u", _base_prog(v=99))
+    # 2) save_attempt
+    with pytest.raises(StoreDegradedError):
+        store.save_attempt("dev-u", _att("att_nuevo"))
+    # 3) update_attempt
+    with pytest.raises(StoreDegradedError):
+        store.update_attempt("dev-u", _att("att_pre", score={"manipulado": True}))
+    # 4) update_attempt_if_status (CAS)
+    with pytest.raises(StoreDegradedError):
+        store.update_attempt_if_status("dev-u", "att_pre", "pending_review",
+                                       _att("att_pre", score={"status": "reviewed"}))
+    # 5) save_report (sobre intento propio existente)
+    with pytest.raises(StoreDegradedError):
+        store.save_report("dev-u", "att_pre", "report.md", "contenido nuevo")
+    # 6) transaction() y 7) mutate_progress (se reafirman con la guarda central)
+    with pytest.raises(StoreDegradedError):
+        with store.transaction("dev-u"):
+            pass
+    with pytest.raises(StoreDegradedError):
+        store.mutate_progress("dev-u", lambda prog: None)
+
+    # NINGÚN archivo fue modificado/creado: integridad byte a byte
+    assert prog_path.read_bytes() == prog_bytes_antes
+    assert att_path.read_bytes() == att_bytes_antes
+    assert not (store.root / "dev-u" / "attempts" / "att_nuevo.json").exists()
+    assert not (store.root / "dev-u" / "reports" / "att_pre.report.md").exists()
+    # lecturas y recuperación explícita siguen operativas
+    assert store.load_progress("dev-u") is not None
+
+
+def test_escrituras_se_reanudan_tras_recuperacion_verificada(tmp_path, monkeypatch):
+    store = JsonProgressStore(root=tmp_path)
+    store.save_progress("dev-u", _base_prog(v=1))
+    store.save_attempt("dev-u", _att("att_pre"))
+    _degradar_store_real(store, monkeypatch)
+
+    # recuperación explícita: progress.json quedó en v2 (JSON válido) -> pasa
+    ok, problems = store.verify_recovery()
+    assert ok is True and problems == [] and store.degraded is None
+
+    # las 5 rutas públicas vuelven a funcionar con normalidad
+    store.save_progress("dev-u", _base_prog(v=5))
+    assert store.load_progress("dev-u")["v"] == 5
+    store.save_attempt("dev-u", _att("att_ok"))
+    assert store.get_attempt("dev-u", "att_ok") is not None
+    assert store.update_attempt("dev-u", _att("att_ok", score={"x": 1})) is True
+    assert store.update_attempt_if_status(
+        "dev-u", "att_pre", "pending_review",
+        _att("att_pre", score={"status": "reviewed"})) is False  # estado no coincide: False normal
+    assert store.save_report("dev-u", "att_ok", "report.md", "r") is not None
+    with store.transaction("dev-u"):
+        store.save_progress("dev-u", _base_prog(v=6))
+    assert store.load_progress("dev-u")["v"] == 6
