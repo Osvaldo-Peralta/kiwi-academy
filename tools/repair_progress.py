@@ -19,19 +19,41 @@ incluido este rebuild, y una instancia nueva de esta herramienta no hereda el
 estado degradado (es estado de instancia en memoria). La reparación con
 contenido legítimamente distinto del original NO satisface la restauración
 exacta (verify_recovery, que exige el sha256 original byte a byte): requiere
-la ruta EXPLÍCITA de recuperación semántica sobre la instancia degradada:
+la ruta EXPLÍCITA de recuperación semántica sobre la instancia degradada, con
+validación de ALCANCE POR ARCHIVO (corrección de auditoría PR #4: un veredicto
+genérico sobre los agregados YA NO libera el store; cada archivo afectado que
+haya quedado modificado —progreso, intentos, reportes— debe ser acreditado
+explícitamente):
 
-    1. calcular el progreso reparado (solo lectura):
-       reparado = service.compute_repaired_progress(user_id)
-       y escribirlo a nivel de archivo (progress.json), o ejecutar esta
-       herramienta con el proceso detenido y reiniciar el servidor.
-    2. acreditar la reparación en la instancia degradada:
-       store.verify_semantic_recovery(
-           lambda s: service.validate_progress_repair(user_id)[0])
+    1. reparar progress.json a nivel de archivo con el estado ORIGINAL como
+       base (el `.rbak` conservado por el rollback fallido), y recalcular los
+       agregados (solo lectura):
 
-Ambos métodos son de solo lectura y funcionan con el store degradado; la
-recuperación solo se concede si el validador confirma que los agregados en
-disco coinciden con la reconstrucción desde los intentos.
+           prog = settings.DATA_DIR / "users" / user_id / "progress.json"
+           prog.write_bytes(Path(str(prog) + ".rbak").read_bytes())
+           reparado = service.compute_repaired_progress(user_id)
+           prog.write_text(json.dumps(reparado, ensure_ascii=False, indent=2))
+
+       (o ejecutar esta herramienta con el proceso detenido y reiniciar el
+       servidor).
+    2. acreditar la recuperación en la instancia degradada con el validador
+       de alcance por archivo:
+
+           store.verify_semantic_recovery(service.semantic_recovery_validator())
+
+       que verifica CADA archivo modificado según su tipo: progreso contra
+       una reconstrucción independiente (agregados desde los intentos +
+       campos no derivados del estado original, `.rbak` verificado por
+       sha256 contra el diario), intentos contra el contrato Attempt
+       (identidad y pertenencia) y reportes por regeneración determinista
+       desde el intento vinculado (existir NO basta). Ante referencias
+       incompletas, tipos no reconocidos, errores de lectura o cualquier
+       archivo sin verificación suficiente, la recuperación se rechaza y el
+       store SIGUE degradado (fallo cerrado).
+
+Los métodos del servicio son de solo lectura y funcionan con el store
+degradado; la recuperación solo se concede si TODOS los archivos afectados
+pasan su verificación específica.
 """
 from __future__ import annotations
 

@@ -11,10 +11,12 @@ Pruebas de fallos inducidos, reintentos, concurrencia y recuperación:
 - Concurrencia de progreso: N hilos => contadores exactos (sin pérdidas).
 - Propiedad: guardar un informe NUNCA reasigna/sobrescribe el de otro usuario.
 """
+import hashlib
 import json
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import jwt as pyjwt
 import pytest
@@ -902,14 +904,16 @@ def test_verify_recovery_rechaza_json_valido_semanticamente_distinto(tmp_path, m
 
 
 def test_ruta_semantica_explicita_para_reparacion_con_contenido_distinto(tmp_path, monkeypatch):
-    """Corrección de auditoría (punto 3): si el operador repara con
-    tools/repair_progress.py (agregados reconstruidos desde los intentos:
-    contenido LEGÍTIMAMENTE distinto del original), la recuperación exacta
-    debe rechazarlo —no se confunde con la restauración del rollback— y solo
-    la ruta semántica EXPLÍCITA (verify_semantic_recovery) con un validador
-    real levanta la degradación. Validador falso, que lanza excepción, o
-    invariante estructural violada (archivo que debía estar eliminado):
-    el store SIGUE degradado."""
+    """Corrección de auditoría (PR #4, ruta semántica): si el operador repara
+    los agregados con contenido LEGÍTIMAMENTE distinto del original (flujo de
+    tools/repair_progress.py), la recuperación exacta debe rechazarlo —no se
+    confunde con la restauración del rollback— y solo la ruta semántica
+    EXPLÍCITA levanta la degradación. Actualizada por la corrección de
+    auditoría de recuperación semántica (alcance por archivo): un veredicto
+    genérico (incluso `True`) NO acredita los archivos modificados; una
+    reparación basada en el estado PARCIAL de la transacción fallida se
+    rechaza aunque sus agregados sean auto-coherentes; los agregados
+    alterados se rechazan; las invariantes estructurales se conservan."""
     store = JsonProgressStore(root=tmp_path)
     service = make_service(store)
 
@@ -924,68 +928,552 @@ def test_ruta_semantica_explicita_para_reparacion_con_contenido_distinto(tmp_pat
     assert store.degraded is not None
     # la transacción fallida dejó progress.json en estado parcial (_base_prog v2)
     assert json.loads(progress_path.read_text(encoding="utf-8")) == _base_prog(v=2)
+    rbak = Path(str(progress_path) + ".rbak")
+    assert rbak.exists(), "el rollback conserva el .rbak como material de recuperación"
 
-    # el operador repara a nivel de archivo con la lógica de repair_progress:
-    # agregados reconstruidos desde los intentos (solo lectura) + escritura
-    # directa (el store degradado rechaza las escrituras vía API)
-    reparado = service.compute_repaired_progress("dev-u")
-    assert reparado != contenido_original      # contenido legítimamente distinto
-    progress_path.write_text(json.dumps(reparado, ensure_ascii=False, indent=2),
+    # 1) "reparación" con base BASURA (el estado parcial de la transacción
+    #    fallida) y agregados auto-coherentes con esa base: el diagnóstico
+    #    genérico la ve consistente — ese es exactamente el defecto auditado:
+    #    no distingue una reparación legítima del estado parcial.
+    reparado_basura = service.compute_repaired_progress("dev-u")
+    progress_path.write_text(json.dumps(reparado_basura, ensure_ascii=False, indent=2),
                              encoding="utf-8")
+    assert service.validate_progress_repair("dev-u")[0] is True, \
+        "precondición del defecto: la comprobación genérica es auto-coherente"
 
-    # 1) la recuperación EXACTA lo rechaza (no se confunde con la reparación)
+    # 1a) la recuperación EXACTA la rechaza (no se confunde con la reparación)
     ok, problems = store.verify_recovery()
     assert ok is False
-    assert any("progress.json" in pr["path"] for pr in problems)
+    assert any("progress.json" in pr["path"] and "DIFIERE" in pr["problem"]
+               for pr in problems)
     assert store.degraded is not None
 
-    # 2) ruta semántica SIN validador válido: rechazada (TypeError)
+    # 1b) ruta semántica SIN validador callable: rechazada (TypeError)
     with pytest.raises(TypeError):
         store.verify_semantic_recovery(None)
     assert store.degraded is not None
 
-    # 3) validador que no acredita (False) o que lanza excepción: degradado
-    ok, problems = store.verify_semantic_recovery(lambda s: False)
+    # 1c) validador que no acredita (False) o que lanza excepción: degradado
+    ok, problems = store.verify_semantic_recovery(lambda ctx: False)
     assert ok is False and store.degraded is not None
     assert any("NO acreditó" in pr["problem"] for pr in problems)
 
-    def validador_roto(s):
+    def validador_roto(ctx):
         raise ValueError("fallo del validador")
     ok, problems = store.verify_semantic_recovery(validador_roto)
     assert ok is False and store.degraded is not None
     assert any("excepción" in pr["problem"] for pr in problems)
 
-    # 4) reparación alterada (agregado inconsistente con los intentos):
-    #    el validador REAL (validate_progress_repair) no la acredita
+    # 1d) veredicto True GENÉRICO sin acreditación por archivo: rechazado
+    #     (núcleo del defecto auditado: el store exige cobertura explícita
+    #     de cada archivo modificado)
+    ok, problems = store.verify_semantic_recovery(lambda ctx: True)
+    assert ok is False and store.degraded is not None
+    assert any(pr["path"] == str(progress_path)
+               and "SIN verificación suficiente" in pr["problem"]
+               for pr in problems)
+
+    # 1e) validador CON ALCANCE (semantic_recovery_validator): rechaza la
+    #     reparación con base basura — los campos no derivados no provienen
+    #     del estado original aunque los agregados se reconstruyan bien
+    ok, problems = store.verify_semantic_recovery(
+        service.semantic_recovery_validator())
+    assert ok is False and store.degraded is not None
+    assert any("NO acreditó" in pr["problem"] for pr in problems)
+
+    # 2) reparación correcta: base ORIGINAL (.rbak) + agregados reconstruidos
+    #    desde los intentos; si se altera un agregado, no se acredita
+    progress_path.write_bytes(rbak.read_bytes())
+    reparado = service.compute_repaired_progress("dev-u")
     alterado = json.loads(json.dumps(reparado))
-    clave_examen = next(iter(alterado["exams"]))
-    alterado["exams"][clave_examen]["best_percent"] = 999.0
+    if alterado.get("exams"):
+        clave_examen = next(iter(alterado["exams"]))
+        alterado["exams"][clave_examen]["best_percent"] = 999.0
+    else:
+        alterado["extra_ilegitimo"] = True
     progress_path.write_text(json.dumps(alterado, ensure_ascii=False, indent=2),
                              encoding="utf-8")
     ok, problems = store.verify_semantic_recovery(
-        lambda s: service.validate_progress_repair("dev-u")[0])
+        service.semantic_recovery_validator())
     assert ok is False and store.degraded is not None
 
-    # 5) invariante estructural: el archivo que debía estar ELIMINADO no
+    # 3) invariante estructural: el archivo que debía estar ELIMINADO no
     #    puede resucitar ni siquiera por la ruta semántica
     progress_path.write_text(json.dumps(reparado, ensure_ascii=False, indent=2),
                              encoding="utf-8")
     att_degradado = store.root / "dev-u" / "attempts" / "att_degradado.json"
     att_degradado.write_text(json.dumps(_att("att_degradado")), encoding="utf-8")
     ok, problems = store.verify_semantic_recovery(
-        lambda s: service.validate_progress_repair("dev-u")[0])
+        service.semantic_recovery_validator())
     assert ok is False and store.degraded is not None
-    assert any("att_degradado" in (pr["path"] or "") for pr in problems)
+    assert any("att_degradado" in (pr["path"] or "")
+               and "sigue existiendo" in pr["problem"] for pr in problems)
     att_degradado.unlink()
 
-    # 6) reparación correcta + validador real: recuperación semántica
+    # 4) reparación correcta + validador con alcance: recuperación semántica
     #    ACREDITADA; escrituras reanudadas
     ok, problems = store.verify_semantic_recovery(
-        lambda s: service.validate_progress_repair("dev-u")[0])
+        service.semantic_recovery_validator())
     assert ok is True and problems == [] and store.degraded is None
     assert service.validate_progress_repair("dev-u")[0] is True
     store.save_attempt("dev-u", _att("att_post"))
     assert store.get_attempt("dev-u", "att_post") is not None
+
+
+# ---------------------------------------------------------------------------
+# Corrección de auditoría PR #4 (recuperación semántica con alcance por
+# archivo): pruebas negativas y de regresión exigidas
+# ---------------------------------------------------------------------------
+
+def _att_ok(att_id, user="dev-u", **extra):
+    """Intento VÁLIDO según el contrato Attempt (Pydantic): id, user_id,
+    scope completo y score. Para pruebas de la ruta semántica con alcance."""
+    base = {"id": att_id, "user_id": user,
+            "submitted_at": "2026-01-01T00:00:00+00:00",
+            "scope": {"type": "lesson", "course_id": COURSE,
+                      "module_id": MOD1, "lesson_id": LESSON1},
+            "score": {"status": "auto_graded", "percent": 50.0, "passed": False},
+            "results": []}
+    base.update(extra)
+    return base
+
+
+def _degradar_con_intento_modificado(store, monkeypatch, intento_modificado):
+    """Degradación REAL en la que un intento PREEXISTENTE y el progreso
+    quedan modificados (ambas restauraciones fallan; los .rbak conservan el
+    estado original). Inyección determinista habitual (proxy de os.replace)."""
+    proxy = _OsProxy(_real_os)
+    monkeypatch.setattr(_jsmod, "os", proxy)
+    with pytest.raises(TransactionRollbackError):
+        with store.transaction("dev-u"):
+            assert store.update_attempt("dev-u", intento_modificado) is True
+            store.save_progress("dev-u", _base_prog(v=2))
+            proxy.fail_replace = True     # la restauración fallará desde aquí
+            raise RuntimeError("fallo original")
+    assert store.degraded is not None
+    proxy.fail_replace = False            # "FS saneado"
+    return proxy
+
+
+def test_semantica_rechaza_intento_preexistente_modificado_sin_acreditar(tmp_path, monkeypatch):
+    """Prueba negativa exigida (auditoría): un archivo de intento
+    preexistente queda MODIFICADO tras el rollback incompleto pero sigue
+    siendo JSON válido. La recuperación semántica debe rechazarlo mientras su
+    contenido no se haya validado y reparado: el veredicto genérico `True` no
+    lo cubre (falta de acreditación explícita) y el validador con alcance lo
+    rechaza si viola identidad/pertenencia/contrato. Solo se libera cuando el
+    intento queda reparado (cambio legítimo que satisface el contrato) y se
+    acredita por archivo."""
+    store = JsonProgressStore(root=tmp_path)
+    service = make_service(store)
+    store.save_progress("dev-u", _base_prog(v=1))
+    store.save_attempt("dev-u", _att_ok("att_pre"))
+    att_path = store.root / "dev-u" / "attempts" / "att_pre.json"
+    prog_path = store.root / "dev-u" / "progress.json"
+
+    adulterado = _att_ok("att_pre", score={"status": "reviewed",
+                                           "percent": 100.0, "passed": True})
+    _degradar_con_intento_modificado(store, monkeypatch, adulterado)
+    # ambos archivos quedan en estado de la transacción fallida; los .rbak
+    # conservan el estado original
+    assert json.loads(att_path.read_text(encoding="utf-8"))["score"]["passed"] is True
+    assert json.loads(prog_path.read_text(encoding="utf-8")) == _base_prog(v=2)
+    assert Path(str(att_path) + ".rbak").exists()
+    assert Path(str(prog_path) + ".rbak").exists()
+
+    # 1) validador GENÉRICO que devuelve True: rechazado — el intento
+    #    modificado y el progreso parcial quedan SIN acreditación explícita
+    ok, problems = store.verify_semantic_recovery(lambda ctx: True)
+    assert ok is False and store.degraded is not None
+    assert any(pr["path"] == str(att_path)
+               and "SIN verificación suficiente" in pr["problem"]
+               for pr in problems)
+    assert any(pr["path"] == str(prog_path)
+               and "SIN verificación suficiente" in pr["problem"]
+               for pr in problems)
+    with pytest.raises(StoreDegradedError):
+        store.save_progress("dev-u", _base_prog(v=99))
+
+    # 2) progreso restaurado con exactitud, pero el intento viola la
+    #    IDENTIDAD (JSON válido; el id no corresponde al archivo): el
+    #    validador con alcance NO acredita
+    prog_path.write_bytes(Path(str(prog_path) + ".rbak").read_bytes())
+    roto = json.loads(att_path.read_text(encoding="utf-8"))
+    roto["id"] = "otro_id"
+    att_path.write_text(json.dumps(roto, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+    json.loads(att_path.read_text(encoding="utf-8"))   # constancia: JSON válido
+    ok, problems = store.verify_semantic_recovery(
+        service.semantic_recovery_validator())
+    assert ok is False and store.degraded is not None
+    assert any("NO acreditó" in pr["problem"] for pr in problems)
+    with pytest.raises(StoreDegradedError):
+        store.save_attempt("dev-u", _att_ok("att_bloqueado"))
+
+    # 2b) pertenencia violada (user_id de otro usuario): tampoco se acredita
+    ajeno = json.loads(att_path.read_text(encoding="utf-8"))
+    ajeno["id"] = "att_pre"
+    ajeno["user_id"] = "otro-usuario"
+    att_path.write_text(json.dumps(ajeno, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+    ok, problems = store.verify_semantic_recovery(
+        service.semantic_recovery_validator())
+    assert ok is False and store.degraded is not None
+
+    # 3) intento reparado con cambio LEGÍTIMO que satisface contrato,
+    #    identidad y pertenencia: la ruta con alcance lo acredita
+    #    explícitamente y el store se libera
+    legitimo = _att_ok("att_pre", feedback_summary="corregido tras revisión manual")
+    att_path.write_text(json.dumps(legitimo, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+    ok, problems = store.verify_semantic_recovery(
+        service.semantic_recovery_validator())
+    assert ok is True and problems == [] and store.degraded is None
+    store.save_progress("dev-u", _base_prog(v=3))
+    assert store.load_progress("dev-u")["v"] == 3
+
+
+def test_semantica_rechaza_reporte_alterado_que_sigue_existiendo(tmp_path, monkeypatch):
+    """Prueba negativa exigida (auditoría): un reporte preexistente queda
+    ALTERADO tras el rollback incompleto pero sigue existiendo. No debe
+    considerarse íntegro solo por existir: el veredicto genérico no lo cubre
+    y el validador con alcance exige que el contenido coincida con la
+    regeneración determinista desde el intento vinculado (contrato de
+    formato)."""
+    store = JsonProgressStore(root=tmp_path)
+    service = make_service(store)
+    sid = start_session(service, user="dev-u")
+    service.submit_exam("dev-u", COURSE, EXAM, sid, blank_responses())
+    att_id = sorted((store.root / "dev-u" / "attempts").glob("*.json"))[0].stem
+    att_path = store.root / "dev-u" / "attempts" / f"{att_id}.json"
+    prog_path = store.root / "dev-u" / "progress.json"
+    md = service.get_attempt_report("dev-u", att_id, fmt="markdown")["report"]
+    assert store.save_report("dev-u", att_id, "report.md", md) is not None
+    report_path = store.root / "dev-u" / "reports" / f"{att_id}.report.md"
+
+    # transacción de revisión que falla a mitad: modifica intento, reporte y
+    # progreso; las tres restauraciones fallan
+    att0 = json.loads(att_path.read_text(encoding="utf-8"))
+    revisado = json.loads(json.dumps(att0))
+    revisado["review"] = {"reviewer": "mentor-1",
+                          "reviewed_at": "2026-01-02T00:00:00+00:00",
+                          "comment": "corrección manual"}
+    revisado["score"] = dict(revisado.get("score") or {})
+    revisado["score"]["status"] = "reviewed"
+
+    proxy = _OsProxy(_real_os)
+    monkeypatch.setattr(_jsmod, "os", proxy)
+    with pytest.raises(TransactionRollbackError):
+        with store.transaction("dev-u"):
+            assert store.update_attempt("dev-u", revisado) is True
+            store.save_report("dev-u", att_id, "report.md",
+                              md + "\n# ESTADO PARCIAL DE LA TX FALLIDA")
+            store.save_progress("dev-u", _base_prog(v=2))
+            proxy.fail_replace = True
+            raise RuntimeError("fallo original")
+    assert store.degraded is not None
+    proxy.fail_replace = False
+    assert "ESTADO PARCIAL" in report_path.read_text(encoding="utf-8")
+
+    # 1) el reporte alterado SIGUE EXISTIENDO: un validador genérico True no
+    #    lo acredita (cobertura por archivo) y el store sigue degradado
+    ok, problems = store.verify_semantic_recovery(lambda ctx: True)
+    assert ok is False and store.degraded is not None
+    assert any(pr["path"] == str(report_path)
+               and "SIN verificación suficiente" in pr["problem"]
+               for pr in problems)
+
+    # 2) progreso restaurado con exactitud, pero el reporte sigue alterado:
+    #    el validador con alcance lo rechaza (no coincide con la
+    #    regeneración desde el intento) — existir NO basta
+    prog_path.write_bytes(Path(str(prog_path) + ".rbak").read_bytes())
+    ok, problems = store.verify_semantic_recovery(
+        service.semantic_recovery_validator())
+    assert ok is False and store.degraded is not None
+
+    # 2b) reporte con "pinta" de markdown (original + basura añadida): sigue
+    #     rechazado — la integridad la exige el contrato, no el formato externo
+    report_path.write_text(md + "\nbasura añadida manualmente", encoding="utf-8")
+    ok, problems = store.verify_semantic_recovery(
+        service.semantic_recovery_validator())
+    assert ok is False and store.degraded is not None
+
+    # 3) reporte REGENERADO de forma determinista desde el intento actual
+    #    (revisado): la recuperación semántica se acredita y las escrituras
+    #    se reanudan
+    md_reparado = service.get_attempt_report("dev-u", att_id,
+                                             fmt="markdown")["report"]
+    assert md_reparado != md, "el intento revisado produce un reporte distinto"
+    report_path.write_text(md_reparado, encoding="utf-8")
+    ok, problems = store.verify_semantic_recovery(
+        service.semantic_recovery_validator())
+    assert ok is True and problems == [] and store.degraded is None
+    store.save_progress("dev-u", _base_prog(v=3))
+    assert store.load_progress("dev-u")["v"] == 3
+
+
+def test_semantica_no_libera_con_archivo_sin_cobertura_aunque_validador_devuelva_true(
+        tmp_path, monkeypatch):
+    """Prueba negativa exigida (auditoría): el progreso reparado es coherente
+    con los intentos, pero OTRO archivo afectado (un intento) continúa
+    inconsistente. Un validador que devuelve True tras acreditar SOLO el
+    progreso no puede liberar el store: la cobertura por archivo lo rechaza y
+    señala el archivo no validado."""
+    store = JsonProgressStore(root=tmp_path)
+    service = make_service(store)
+    store.save_progress("dev-u", _base_prog(v=1))
+    store.save_attempt("dev-u", _att_ok("att_pre"))
+    att_path = store.root / "dev-u" / "attempts" / "att_pre.json"
+    prog_path = store.root / "dev-u" / "progress.json"
+
+    adulterado = _att_ok("att_pre", score={"status": "reviewed",
+                                           "percent": 100.0, "passed": True})
+    _degradar_con_intento_modificado(store, monkeypatch, adulterado)
+
+    # el operador repara SOLO el progreso (base original + agregados
+    # reconstruidos): contenido legítimamente distinto del original
+    prog_path.write_bytes(Path(str(prog_path) + ".rbak").read_bytes())
+    reparado = service.compute_repaired_progress("dev-u")
+    prog_path.write_text(json.dumps(reparado, ensure_ascii=False, indent=2),
+                         encoding="utf-8")
+    assert reparado != json.loads(Path(str(prog_path) + ".rbak").read_text(
+        encoding="utf-8")), "precondición: el progreso reparado difiere del original"
+
+    def validador_parcial(ctx):
+        # acredita SOLO el progreso (agregados coherentes con los intentos)
+        # y devuelve True: el intento adulterado queda sin cobertura
+        for f in ctx.modified_files():
+            if f.kind == "progress":
+                ctx.mark_validated(f.path,
+                                   "agregados reconstruidos desde los intentos")
+        return True
+
+    ok, problems = store.verify_semantic_recovery(validador_parcial)
+    assert ok is False and store.degraded is not None
+    assert any(pr["path"] == str(att_path)
+               and "SIN verificación suficiente" in pr["problem"]
+               for pr in problems)
+    assert not any(pr["path"] == str(prog_path) for pr in problems), \
+        "el progreso SÍ fue acreditado explícitamente: no debe aparecer"
+    with pytest.raises(StoreDegradedError):
+        store.save_attempt("dev-u", _att_ok("att_bloqueado"))
+
+    # acreditando también el intento (reparado con cambio legítimo), la
+    # recuperación sí pasa: la cobertura por archivo es lo único que faltaba
+    att_path.write_text(json.dumps(
+        _att_ok("att_pre", feedback_summary="revisado"),
+        ensure_ascii=False, indent=2), encoding="utf-8")
+    ok, problems = store.verify_semantic_recovery(
+        service.semantic_recovery_validator())
+    assert ok is True and problems == [] and store.degraded is None
+
+
+@pytest.mark.parametrize("verdicto", [False, None, 0, 1, "True", [], {}, (True,)])
+def test_semantica_rechaza_veredictos_invalidos_del_validador(
+        tmp_path, monkeypatch, verdicto):
+    """Prueba negativa exigida (auditoría): el validador devuelve False,
+    None, un valor distinto de True (incluidos truthy como 1, 'True', (True,))
+    => la ruta semántica NO libera el store (se exige exactamente `True`) y
+    las escrituras siguen rechazadas."""
+    store = JsonProgressStore(root=tmp_path)
+    store.save_progress("dev-u", _base_prog(v=1))
+    _degradar_store_real(store, monkeypatch)
+
+    ok, problems = store.verify_semantic_recovery(lambda ctx: verdicto)
+    assert ok is False and store.degraded is not None
+    assert any("NO acreditó" in pr["problem"] for pr in problems)
+    with pytest.raises(StoreDegradedError):
+        store.save_progress("dev-u", _base_prog(v=99))
+
+
+def test_semantica_rechaza_validador_que_lanza_excepcion(tmp_path, monkeypatch):
+    """Prueba negativa exigida (auditoría): un validador que lanza excepción
+    no libera el store; el fallo se reporta y se conserva el estado degradado
+    (fallo cerrado)."""
+    store = JsonProgressStore(root=tmp_path)
+    store.save_progress("dev-u", _base_prog(v=1))
+    _degradar_store_real(store, monkeypatch)
+
+    def validador_roto(ctx):
+        raise ValueError("fallo del validador")
+
+    ok, problems = store.verify_semantic_recovery(validador_roto)
+    assert ok is False and store.degraded is not None
+    assert any("excepción" in pr["problem"] for pr in problems)
+    with pytest.raises(StoreDegradedError):
+        store.save_progress("dev-u", _base_prog(v=99))
+
+
+def test_semantica_falla_cerrado_referencias_incompletas_e_ilegibles(
+        tmp_path, monkeypatch):
+    """Prueba negativa exigida (auditoría): falta una referencia fiable en el
+    diario, un archivo requerido no puede leerse, existe el archivo que debía
+    estar ausente, o un archivo de tipo NO reconocido quedó modificado: la
+    ruta semántica falla de forma CERRADA y conserva el estado degradado en
+    todos los casos."""
+    store = JsonProgressStore(root=tmp_path)
+    store.save_progress("dev-u", _base_prog(v=1))
+    _degradar_store_real(store, monkeypatch)
+    prog_path = store.root / "dev-u" / "progress.json"
+    att_degradado = store.root / "dev-u" / "attempts" / "att_degradado.json"
+    service = make_service(store)
+    validador = service.semantic_recovery_validator()
+    checks = store.degraded["checks"]
+    entrada = next(c for c in checks if c["path"] == str(prog_path))
+
+    # (a) el archivo que debía estar AUSENTE vuelve a existir: rechazo
+    #     estructural, incluso con un validador perfecto
+    att_degradado.write_text(json.dumps(_att("att_degradado")), encoding="utf-8")
+    ok, problems = store.verify_semantic_recovery(validador)
+    assert ok is False and store.degraded is not None
+    assert any("att_degradado" in (pr["path"] or "")
+               and "sigue existiendo" in pr["problem"] for pr in problems)
+    att_degradado.unlink()
+
+    # (b) referencia incompleta en el diario (sin sha256 original): fallo
+    #     cerrado por diseño en la ruta semántica…
+    sha_original = entrada.pop("sha256")
+    ok, problems = store.verify_semantic_recovery(validador)
+    assert ok is False and store.degraded is not None
+    assert any("sin referencia fiable" in pr["problem"] for pr in problems)
+    entrada["sha256"] = sha_original
+
+    #     …y también en la ruta exacta
+    sha_2 = entrada.pop("sha256")
+    ok, problems = store.verify_recovery()
+    assert ok is False and store.degraded is not None
+    assert any("sin referencia fiable" in pr["problem"] for pr in problems)
+    entrada["sha256"] = sha_2
+
+    # (b2) entrada sin "expect": sin referencia fiable (fallo cerrado)
+    expect_original = entrada.pop("expect")
+    ok, problems = store.verify_semantic_recovery(validador)
+    assert ok is False and store.degraded is not None
+    assert any("sin referencia fiable" in pr["problem"] for pr in problems)
+    entrada["expect"] = expect_original
+
+    # (c) archivo requerido que NO PUEDE LEERSE (un directorio ocupa su
+    #     lugar): fallo cerrado
+    prog_path.unlink()
+    prog_path.mkdir()
+    ok, problems = store.verify_semantic_recovery(validador)
+    assert ok is False and store.degraded is not None
+    assert any("no se pudo leer" in pr["problem"] for pr in problems)
+    prog_path.rmdir()
+    prog_path.write_bytes(Path(str(prog_path) + ".rbak").read_bytes())
+
+    # (d) archivo MODIFICADO de tipo NO reconocido por el layout del store:
+    #     la ruta semántica no puede verificar su finalidad (fallo cerrado)
+    notas = store.root / "dev-u" / "notas.txt"
+    notas.write_text("contenido cualquiera", encoding="utf-8")
+    checks.append({"path": str(notas), "expect": "sha256",
+                   "sha256": hashlib.sha256(b"otro contenido").hexdigest()})
+    ok, problems = store.verify_semantic_recovery(validador)
+    assert ok is False and store.degraded is not None
+    assert any("tipo NO reconocido" in pr["problem"] for pr in problems)
+
+    # tras sanear el diario y el archivo, la recuperación exacta verifica
+    checks.pop()
+    notas.unlink()
+    ok, problems = store.verify_recovery()
+    assert ok is True and problems == [] and store.degraded is None
+
+
+def test_semantica_solo_reanuda_escrituras_con_cobertura_completa_por_archivo(
+        tmp_path, monkeypatch):
+    """Prueba positiva exigida (auditoría): la recuperación semántica solo
+    reanuda las escrituras cuando TODOS los archivos afectados pasan su
+    verificación específica —intento modificado legítimo (contrato,
+    identidad, pertenencia), reporte regenerado desde el intento, progreso
+    reconstruido sobre el estado original— y el archivo creado por la
+    transacción fallida está ausente. Mientras falta cobertura, el store
+    sigue degradado; tras acreditarla, las siete rutas públicas de escritura
+    funcionan de nuevo."""
+    store = JsonProgressStore(root=tmp_path)
+    service = make_service(store)
+    sid = start_session(service, user="dev-u")
+    service.submit_exam("dev-u", COURSE, EXAM, sid, blank_responses())
+    att_id = sorted((store.root / "dev-u" / "attempts").glob("*.json"))[0].stem
+    att_path = store.root / "dev-u" / "attempts" / f"{att_id}.json"
+    prog_path = store.root / "dev-u" / "progress.json"
+    md_original = service.get_attempt_report("dev-u", att_id,
+                                             fmt="markdown")["report"]
+    assert store.save_report("dev-u", att_id, "report.md", md_original) is not None
+    report_path = store.root / "dev-u" / "reports" / f"{att_id}.report.md"
+
+    # transacción de revisión que falla a mitad: modifica intento, reporte y
+    # progreso, y crea un intento nuevo (que el rollback sí logra borrar)
+    att0 = json.loads(att_path.read_text(encoding="utf-8"))
+    revisado = json.loads(json.dumps(att0))
+    revisado["review"] = {"reviewer": "mentor-1",
+                          "reviewed_at": "2026-01-02T00:00:00+00:00",
+                          "comment": "corrección manual"}
+    revisado["score"] = dict(revisado.get("score") or {})
+    revisado["score"]["status"] = "reviewed"
+
+    proxy = _OsProxy(_real_os)
+    monkeypatch.setattr(_jsmod, "os", proxy)
+    with pytest.raises(TransactionRollbackError):
+        with store.transaction("dev-u"):
+            assert store.update_attempt("dev-u", revisado) is True
+            store.save_report("dev-u", att_id, "report.md",
+                              md_original + "\n# ESTADO PARCIAL DE LA TX")
+            store.save_attempt("dev-u", _att_ok("att_nuevo"))
+            store.save_progress("dev-u", _base_prog(v=2))
+            proxy.fail_replace = True
+            raise RuntimeError("fallo original")
+    assert store.degraded is not None
+    proxy.fail_replace = False
+    assert not (store.root / "dev-u" / "attempts" / "att_nuevo.json").exists(), \
+        "el rollback borró el archivo creado (expect absent verificado)"
+
+    # 0) sin reparar nada: el veredicto True genérico NO libera el store —
+    #    faltan las tres acreditaciones por archivo
+    ok, problems = store.verify_semantic_recovery(lambda ctx: True)
+    assert ok is False and store.degraded is not None
+    sin_cobertura = {pr["path"] for pr in problems
+                     if "SIN verificación suficiente" in pr["problem"]}
+    assert sin_cobertura == {str(att_path), str(report_path), str(prog_path)}
+    with pytest.raises(StoreDegradedError):
+        store.save_progress("dev-u", _base_prog(v=99))
+
+    # 1) reparación correcta de cada archivo afectado:
+    #    - intento: queda el estado revisado legítimo (contrato/identidad/
+    #      pertenencia verificables)
+    #    - reporte: regeneración determinista desde el intento actual
+    md_reparado = service.get_attempt_report("dev-u", att_id,
+                                             fmt="markdown")["report"]
+    assert md_reparado != md_original
+    report_path.write_text(md_reparado, encoding="utf-8")
+    #    - progreso: base ORIGINAL (.rbak) + agregados reconstruidos desde
+    #      los intentos (fuente de verdad)
+    prog_path.write_bytes(Path(str(prog_path) + ".rbak").read_bytes())
+    reparado = service.compute_repaired_progress("dev-u")
+    prog_path.write_text(json.dumps(reparado, ensure_ascii=False, indent=2),
+                         encoding="utf-8")
+
+    # 2) validador con alcance: TODOS los archivos modificados acreditados
+    ok, problems = store.verify_semantic_recovery(
+        service.semantic_recovery_validator())
+    assert ok is True and problems == [] and store.degraded is None
+
+    # 3) las siete rutas públicas de escritura vuelven a funcionar
+    store.save_progress("dev-u", _base_prog(v=3))                       # 1
+    assert store.load_progress("dev-u")["v"] == 3
+    store.save_attempt("dev-u", _att_ok("att_post"))                    # 2
+    assert store.get_attempt("dev-u", "att_post") is not None
+    assert store.update_attempt(                                        # 3
+        "dev-u", _att_ok("att_post", feedback_summary="x")) is True
+    assert store.update_attempt_if_status(                              # 4
+        "dev-u", "att_post", "estado_que_no_existe",
+        _att_ok("att_post")) is False
+    assert store.save_report(                                           # 5
+        "dev-u", "att_post", "report.md", "r") is not None
+    with store.transaction("dev-u"):                                    # 6
+        store.save_progress("dev-u", _base_prog(v=4))
+    assert store.load_progress("dev-u")["v"] == 4
+    store.mutate_progress("dev-u", lambda prog: prog.update(v=5))       # 7
+    assert store.load_progress("dev-u")["v"] == 5
 
 
 def test_escritura_directa_y_verificaciones_se_serializan_con_lock_global(tmp_path):

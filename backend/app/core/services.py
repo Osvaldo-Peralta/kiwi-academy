@@ -5,9 +5,12 @@ traduce HTTP <-> servicios; los servicios no saben nada de HTTP.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import secrets
 from datetime import datetime, timezone
-from typing import Any, Optional
+from pathlib import Path
+from typing import Any, Callable, Optional
 
 from .errors import (
     ExamStateError,
@@ -23,6 +26,7 @@ from .feedback import (
 )
 from .models import Attempt, Exercise, QuestionResult
 from ..config import settings
+from ..storage.json_store import KIND_ATTEMPT, KIND_PROGRESS, KIND_REPORT
 from ..storage.repositories import ContentRepository, ProgressRepository
 
 
@@ -709,9 +713,10 @@ class LearningService:
 
         Contrapartes de solo lectura (corrección de auditoría PR #4, store
         degradado): `compute_repaired_progress` (calcula el progreso reparado
-        SIN escribir) y `validate_progress_repair` (acredita que el progreso
-        en disco es consistente con los intentos; se usa como validador de la
-        ruta explícita de recuperación semántica del store,
+        SIN escribir), `validate_progress_repair` (diagnóstico: el progreso
+        en disco es consistente con los intentos) y
+        `semantic_recovery_validator` (validador con alcance POR ARCHIVO de
+        la ruta explícita de recuperación semántica del store,
         `verify_semantic_recovery`).
         """
         return self.progress.mutate_progress(
@@ -796,8 +801,17 @@ class LearningService:
         usar este método para obtener el contenido reparado, escribirlo
         directamente y acreditarlo después con la ruta explícita de
         recuperación semántica del store:
-        `store.verify_semantic_recovery(
-            lambda s: service.validate_progress_repair(user_id)[0])`."""
+        `store.verify_semantic_recovery(service.semantic_recovery_validator())`.
+
+        IMPORTANTE (corrección de auditoría PR #4, recuperación semántica):
+        en una recuperación del store degradado la base de la reparación debe
+        ser el estado ORIGINAL —los bytes del `.rbak` conservado por el
+        rollback fallido—: restitúyalos primero en progress.json y calcule
+        DESPUÉS esta reconstrucción. `semantic_recovery_validator()` exige
+        exactamente eso (campos no derivados del estado original + agregados
+        derivados reconstruidos desde los intentos); una reparación basada en
+        el estado parcial de la transacción fallida será rechazada aunque sus
+        agregados sean auto-coherentes."""
         prog = self.progress.get_progress(user_id)
         self._apply_rebuilt_aggregates(user_id, prog)
         return prog
@@ -808,10 +822,13 @@ class LearningService:
         (los intentos son la fuente de verdad; los agregados, datos
         derivados).
 
-        Destinado a servir de validador en la ruta explícita de recuperación
-        semántica del store (`JsonProgressStore.verify_semantic_recovery`)
-        tras una reparación con contenido legítimamente distinto del
-        original (p. ej. tools/repair_progress.py). Devuelve (ok, detalle)."""
+        Destinado a DIAGNÓSTICO complementario (solo lectura). Nota
+        (corrección de auditoría PR #4, recuperación semántica): por sí solo
+        NO es un validador suficiente para la ruta semántica del store —solo
+        cubre los agregados de progreso y no demuestra la integridad de los
+        demás archivos afectados por el rollback (intentos, reportes)—; el
+        validador con alcance por archivo es `semantic_recovery_validator()`.
+        Devuelve (ok, detalle)."""
         actual = self.progress.get_progress(user_id)
         expected = self.compute_repaired_progress(user_id)
         ok = actual == expected
@@ -821,6 +838,195 @@ class LearningService:
                                  "reconstrucción desde los intentos "
                                  "(reparación incompleta o agregados alterados)")
         return ok, detail
+
+    # ------------------------------------------------------------------
+    # Recuperación semántica con ALCANCE POR ARCHIVO (corrección de
+    # auditoría PR #4): validador explícito para la ruta semántica del
+    # store JSON degradado (verify_semantic_recovery).
+    # ------------------------------------------------------------------
+
+    def semantic_recovery_validator(self) -> Callable[[Any], bool]:
+        """Construye el validador CON ALCANCE POR ARCHIVO de la ruta explícita
+        de recuperación semántica del store JSON
+        (`JsonProgressStore.verify_semantic_recovery`).
+
+        Defecto auditado que corrige: un validador genérico que solo comprueba
+        que los agregados de progreso pueden reconstruirse desde los intentos
+        NO demuestra que TODOS los archivos afectados por el rollback estén
+        íntegros — un intento preexistente modificado (aunque siga siendo
+        JSON válido) o un reporte alterado que sigue existiendo pasaban por
+        íntegros y el store quedaba liberado. Este validador audita cada
+        archivo MODIFICADO respecto del estado original esperado (diario de
+        rollback expuesto en el `SemanticRecoveryContext`) y lo acredita
+        explícitamente (`ctx.mark_validated`) solo si supera la verificación
+        apropiada para su tipo y finalidad:
+
+          - progreso (`progress.json`): el contenido reparado debe coincidir
+            con una reconstrucción INDEPENDIENTE: los agregados derivados
+            recalculados desde los intentos (fuente de verdad) aplicados
+            sobre los campos NO derivados del estado ORIGINAL —recuperado
+            del `.rbak` conservado por el rollback fallido, cuyo sha256 se
+            comprueba contra el diario—. Sin `.rbak` fiable no se acredita
+            (fallo cerrado): no hay forma de distinguir una reparación
+            legítima del estado parcial de la transacción fallida.
+          - intentos (`attempts/<id>.json`): deben satisfacer el contrato
+            `Attempt` (Pydantic) y las invariantes de IDENTIDAD (`id` ==
+            nombre del archivo) y PERTENENCIA (`user_id` == directorio
+            contenedor).
+          - reportes (`reports/<attempt>.<nombre>`): NO se asume que un
+            reporte está íntegro solo por existir: el intento vinculado debe
+            existir y pertenecer al usuario (contrato de `save_report`) y el
+            contenido debe coincidir con la regeneración determinista desde
+            el intento actual (markdown de `render_report_markdown` para
+            `.md`, `render_attempt_json` para `.json`). Formato no
+            reconocido: no se acredita (fallo cerrado).
+
+        Devuelve exactamente True solo si TODOS los archivos modificados
+        superan su comprobación específica y quedan acreditados; False en
+        cuanto uno falla (el store sigue degradado). Los archivos
+        restaurados con exactitud (sha256 == estado original) y los que
+        debían estar ausentes los verifica el store por sí mismo
+        (invariantes estructurales + auditoría del diario).
+        """
+        def validator(ctx: Any) -> bool:
+            # orden determinista: intentos → reportes (se regeneran desde el
+            # intento) → progreso (agregados derivados de los intentos)
+            orden = {KIND_ATTEMPT: 0, KIND_REPORT: 1, KIND_PROGRESS: 2}
+            for f in sorted(ctx.modified_files(),
+                            key=lambda x: orden.get(x.kind, 99)):
+                if f.kind == KIND_ATTEMPT:
+                    ok = self._acreditar_intento_modificado(ctx, f)
+                elif f.kind == KIND_REPORT:
+                    ok = self._acreditar_reporte_modificado(ctx, f)
+                elif f.kind == KIND_PROGRESS:
+                    ok = self._acreditar_progreso_modificado(ctx, f)
+                else:
+                    ok = False   # defensivo: el store ya rechaza tipos desconocidos
+                if not ok:
+                    return False  # fallo cerrado: no se acredita cobertura parcial
+            return True
+        return validator
+
+    def _acreditar_intento_modificado(self, ctx: Any, f: Any) -> bool:
+        """Verificación con alcance de un intento modificado: contrato del
+        dominio (`Attempt`), IDENTIDAD (`id` == nombre del archivo) y
+        PERTENENCIA (`user_id` == directorio contenedor)."""
+        try:
+            data = f.read_json()
+        except (OSError, ValueError, UnicodeDecodeError):
+            return False
+        if not isinstance(data, dict):
+            return False
+        path = Path(f.path)
+        if data.get("id") != path.stem:
+            return False        # identidad: el id debe corresponder al archivo
+        user_dir = path.parent.parent.name
+        if data.get("user_id") != user_dir:
+            return False        # pertenencia: intento del usuario del directorio
+        try:
+            Attempt.model_validate(data)
+        except Exception:
+            return False        # contrato/consistencia del dominio
+        ctx.mark_validated(
+            f.path,
+            "intento verificado contra el contrato Attempt; identidad "
+            "(id == nombre de archivo) y pertenencia (user_id == directorio) "
+            "confirmadas")
+        return True
+
+    def _acreditar_reporte_modificado(self, ctx: Any, f: Any) -> bool:
+        """Verificación con alcance de un reporte modificado: vínculo de
+        propiedad (el intento vinculado existe y pertenece al usuario,
+        contrato de `save_report`) e integridad de contenido exigida por su
+        formato — regeneración determinista desde el intento actual. Que el
+        archivo exista NO lo acredita."""
+        path = Path(f.path)
+        attempt_id, sep, name_part = path.name.partition(".")
+        if not sep or not attempt_id or not name_part:
+            return False        # nombre fuera de contrato (<attempt>.<nombre>)
+        user_dir = path.parent.parent.name
+        attempt_data = ctx.store.get_attempt(user_dir, attempt_id)
+        if not attempt_data:
+            return False        # reporte sin intento propio existente
+        try:
+            content = f.read_text()
+        except (OSError, UnicodeDecodeError):
+            return False
+        suffix = path.suffix.lower()
+        try:
+            if suffix == ".md":
+                esperado = self._render_report_for_attempt(attempt_data)
+                if content != esperado:
+                    return False
+                garantia = ("reporte markdown coincide con la regeneración "
+                            "determinista desde el intento actual (integridad "
+                            "de formato y contrato, no mera existencia)")
+            elif suffix == ".json":
+                attempt = Attempt.model_validate(attempt_data)
+                esperado = render_attempt_json(
+                    attempt, self._exercises_for_attempt(attempt))
+                if json.loads(content) != esperado:
+                    return False
+                garantia = ("reporte JSON coincide con render_attempt_json "
+                            "desde el intento actual (integridad de formato "
+                            "y contrato, no mera existencia)")
+            else:
+                return False    # formato no reconocido: verificación insuficiente
+        except Exception:
+            return False
+        ctx.mark_validated(f.path, garantia)
+        return True
+
+    def _acreditar_progreso_modificado(self, ctx: Any, f: Any) -> bool:
+        """Verificación con alcance del progreso modificado: el contenido
+        actual debe coincidir con una reconstrucción INDEPENDIENTE —agregados
+        derivados recalculados desde los intentos (fuente de verdad) sobre
+        los campos no derivados del estado ORIGINAL (`.rbak` conservado por
+        el rollback fallido, verificado por sha256 contra el diario)—. Una
+        reparación basada en el estado parcial de la transacción fallida NO
+        se acredita, aunque sus agregados sean auto-coherentes."""
+        rbak = f.rbak_bytes()
+        if rbak is None:
+            return False        # sin referencia del estado original: fallo cerrado
+        if hashlib.sha256(rbak).hexdigest() != f.original_sha256:
+            return False        # el .rbak no corresponde al diario: no es fiable
+        try:
+            base = json.loads(rbak.decode("utf-8"))
+            actual = f.read_json()
+        except (OSError, ValueError, UnicodeDecodeError):
+            return False
+        if not isinstance(base, dict) or not isinstance(actual, dict):
+            return False
+        user_dir = Path(f.path).parent.name
+        esperado = dict(base)
+        self._apply_rebuilt_aggregates(user_dir, esperado)
+        if actual != esperado:
+            return False
+        ctx.mark_validated(
+            f.path,
+            "progreso reparado coincide con la reconstrucción independiente: "
+            "agregados derivados recalculados desde los intentos (fuente de "
+            "verdad) sobre los campos no derivados del estado original "
+            "(.rbak verificado por sha256 contra el diario)")
+        return True
+
+    def _render_report_for_attempt(self, attempt_data: dict[str, Any]) -> str:
+        """Regeneración determinista del reporte markdown de un intento
+        (mismo contrato de renderizado que los flujos de exportación/revisión:
+        `render_report_markdown` con los ejercicios y títulos del contenido).
+        Función pura de los datos del intento + contenido: sin reloj ni
+        estado externo."""
+        attempt = Attempt.model_validate(attempt_data)
+        exercises = self._exercises_for_attempt(attempt)
+        scope = attempt.scope
+        title = scope.exam_id or scope.lesson_id or "Evaluación"
+        course_title = ""
+        try:
+            course_title = self.content.get_course(scope.course_id).title
+        except NotFoundError:
+            pass
+        return render_report_markdown(attempt, exercises,
+                                      course_title=course_title, scope_title=title)
 
     # ------------------------------------------------------------------
     # Reportes / historial

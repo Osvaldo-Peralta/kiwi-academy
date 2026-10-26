@@ -129,9 +129,13 @@ class ProgressStore(ABC):
           verificada: `verify_recovery()` (restauración EXACTA, comprobada
           byte a byte contra el sha256 original registrado antes del
           rollback) o `verify_semantic_recovery(validator)` (ruta explícita
-          para reparaciones con contenido legítimamente distinto, acreditada
-          por un validador), o la reconstrucción de la instancia tras
-          reparar los archivos.
+          para reparaciones con contenido legítimamente distinto: exige un
+          validador CON ALCANCE POR ARCHIVO que acredite explícitamente cada
+          archivo afectado modificado —progreso, intentos, reportes— vía
+          `SemanticRecoveryContext.mark_validated`; un veredicto genérico no
+          libera el store; ver
+          `LearningService.semantic_recovery_validator`), o la
+          reconstrucción de la instancia tras reparar los archivos.
 
         Anidable: una transacción interna se une a la externa.
         """

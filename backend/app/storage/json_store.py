@@ -50,8 +50,12 @@ class TransactionRollbackError(RuntimeError):
     hasta una recuperación explícita y verificada: restauración exacta
     (`JsonProgressStore.verify_recovery()`, que compara el contenido real
     contra el sha256 original registrado antes del rollback) o reparación
-    semántica acreditada (`verify_semantic_recovery(validator)`), o la
-    reconstrucción de la instancia tras reparar los archivos. La finalidad
+    semántica acreditada POR ARCHIVO
+    (`verify_semantic_recovery(validator)`: todo archivo afectado que
+    difiera de su estado original debe quedar explícitamente acreditado por
+    un validador con alcance apropiado a su tipo; un veredicto genérico no
+    libera el store), o la reconstrucción de la instancia tras reparar los
+    archivos. La finalidad
     no es garantizar la recuperación ante cualquier fallo físico, sino
     impedir que el sistema siga escribiendo como si estuviera íntegro.
 
@@ -93,7 +97,12 @@ class StoreDegradedError(RuntimeError):
           — ruta EXPLÍCITA de recuperación SEMÁNTICA para reparaciones con
           contenido legítimamente distinto del original (p. ej. agregados
           reconstruidos con tools/repair_progress.py): exige un validador
-          que acredite positivamente la reparación, o
+          CON ALCANCE POR ARCHIVO que acredite explícitamente CADA archivo
+          afectado modificado (`SemanticRecoveryContext.mark_validated`);
+          un veredicto genérico —p. ej. "los agregados se reconstruyen desde
+          los intentos"— NO libera el store si algún archivo (intento,
+          reporte, …) queda sin verificación suficiente. Validador de
+          referencia: `LearningService.semantic_recovery_validator()`, o
       (c) reconstruir una instancia del store después de recuperar los
           archivos (p. ej. restaurando desde los `.rbak` conservados y/o
           usando tools/repair_progress.py).
@@ -108,6 +117,142 @@ class StoreDegradedError(RuntimeError):
             "acreditada (verify_semantic_recovery)— o reconstrucción de la "
             "instancia. Detalles: " + json.dumps(degraded_info, ensure_ascii=False, default=str)[:600]
         )
+
+
+# -- recuperación semántica con alcance por archivo (corrección auditoría
+#    PR #4: un veredicto genérico del validador NO acredita la integridad de
+#    cada archivo afectado por el rollback) ----------------------------------
+
+# Tipos de archivo reconocidos por el layout del store. Un archivo afectado
+# fuera de esta clasificación es "desconocido": el store no puede razonar
+# sobre su finalidad y la ruta semántica lo rechaza (fallo cerrado) si quedó
+# modificado respecto de su estado original.
+KIND_PROGRESS = "progress"
+KIND_ATTEMPT = "attempt"
+KIND_REPORT = "report"
+KIND_UNKNOWN = "desconocido"
+
+# Resultado de la auditoría del diario por archivo (ruta semántica):
+STATUS_ABSENT_OK = "ausente_confirmado"   # debía no existir y no existe
+STATUS_EXACT = "restaurado_exacto"        # contenido == estado original (sha256)
+STATUS_MODIFIED = "modificado"            # contenido difiere: exige acreditación explícita
+
+
+class SemanticRecoveryFile:
+    """Un archivo afectado por la transacción fallida, auditado desde el
+    diario de rollback (entrada `checks` del registro de degradación).
+
+    Atributos:
+      path: ruta absoluta del archivo.
+      kind: clasificación por layout del store (`KIND_*`).
+      expect: "sha256" (preexistente) o "absent" (creado por la transacción).
+      original_sha256: sha256 del contenido original registrado ANTES del
+        rollback (None si expect == "absent").
+      status: resultado de la auditoría (`STATUS_*`).
+    """
+
+    __slots__ = ("path", "kind", "expect", "original_sha256", "status")
+
+    def __init__(self, path: str, kind: str, expect: str,
+                 original_sha256: Optional[str], status: str):
+        self.path = str(path)
+        self.kind = kind
+        self.expect = expect
+        self.original_sha256 = original_sha256
+        self.status = status
+
+    def __repr__(self) -> str:
+        return (f"<SemanticRecoveryFile {self.path!r} kind={self.kind} "
+                f"expect={self.expect} status={self.status}>")
+
+    def read_bytes(self) -> bytes:
+        return Path(self.path).read_bytes()
+
+    def read_text(self) -> str:
+        return self.read_bytes().decode("utf-8")
+
+    def read_json(self) -> Any:
+        return json.loads(self.read_text())
+
+    def rbak_bytes(self) -> Optional[bytes]:
+        """Bytes originales conservados por el rollback fallido (`<path>.rbak`,
+        ver `_rollback`), o None si no existen o no pueden leerse. El
+        validador debe comprobar su sha256 contra `original_sha256` antes de
+        usarlos como referencia."""
+        rbak = Path(self.path + ".rbak")
+        try:
+            if not rbak.exists():
+                return None
+            return rbak.read_bytes()
+        except OSError:
+            return None
+
+
+class SemanticRecoveryContext:
+    """Auditoría completa del diario de la transacción fallida, entregada al
+    validador de la ruta semántica (corrección de auditoría PR #4:
+    recuperación semántica con alcance por archivo).
+
+    Un veredicto genérico YA NO basta para liberar el store: el validador
+    recibe este contexto con TODOS los archivos afectados clasificados por
+    tipo y estado, y DEBE acreditar explícitamente cada archivo MODIFICADO
+    respecto de su estado original llamando a `mark_validated(path,
+    garantía)` con una validación apropiada para su tipo y finalidad. El
+    store rechaza la recuperación si algún archivo modificado carece de
+    acreditación explícita, aunque el validador haya devuelto `True`.
+
+    Atributos:
+      store: la instancia degradada (acceso de SOLO LECTURA; sus escrituras
+        siguen rechazadas con `StoreDegradedError` hasta que la recuperación
+        se acredite).
+      user_id: usuario de la transacción fallida.
+      original_error: error que abortó la transacción (diagnóstico).
+      files: todas las entradas auditadas del diario (`SemanticRecoveryFile`).
+      validated: {ruta: garantía} registradas explícitamente por el validador.
+    """
+
+    def __init__(self, store: "JsonProgressStore", user_id: Optional[str],
+                 original_error: Optional[str],
+                 files: list[SemanticRecoveryFile]):
+        self.store = store
+        self.user_id = user_id
+        self.original_error = original_error
+        self.files = list(files)
+        self.validated: dict[str, str] = {}
+
+    def file(self, path: Any) -> Optional[SemanticRecoveryFile]:
+        key = str(path)
+        for f in self.files:
+            if f.path == key:
+                return f
+        return None
+
+    def modified_files(self, kind: Optional[str] = None) -> list[SemanticRecoveryFile]:
+        """Archivos cuyo contenido DIFIERE del estado original esperado: son
+        los que exigen acreditación explícita (por tipo, si se indica)."""
+        return [f for f in self.files
+                if f.status == STATUS_MODIFIED and (kind is None or f.kind == kind)]
+
+    def mark_validated(self, path: Any, guarantee: str) -> None:
+        """Acredita explícitamente que `path` —archivo afectado MODIFICADO—
+        fue verificado con alcance apropiado a su tipo y finalidad.
+        `guarantee` describe qué se comprobó realmente y queda registrada
+        como evidencia de auditoría.
+
+        Lanza ValueError si el archivo no está afectado/modificado en el
+        diario o si la garantía está vacía: la ruta semántica falla de forma
+        cerrada ante el uso indebido del contrato."""
+        f = self.file(path)
+        if f is None or f.status != STATUS_MODIFIED:
+            raise ValueError(
+                f"mark_validated: {str(path)!r} no es un archivo afectado "
+                "MODIFICADO por la transacción fallida (solo esos requieren "
+                "—y admiten— acreditación explícita)")
+        if not isinstance(guarantee, str) or not guarantee.strip():
+            raise ValueError(
+                "mark_validated exige una garantía no vacía que describa la "
+                f"verificación realizada de {f.path}")
+        self.validated[f.path] = guarantee.strip()
 
 
 _LOCKS: dict[str, threading.RLock] = {}
@@ -501,41 +646,85 @@ class JsonProgressStore(ProgressStore):
 
     # -- recuperación explícita y verificable del estado degradado ------------
 
-    def _verify_expected_state(self, exact: bool) -> list[dict[str, Any]]:
-        """Compara el disco contra el estado esperado registrado al degradar
-        (corrección de auditoría PR #4: verificación del estado REAL, no de
-        la mera presencia/validez sintáctica).
+    def _classify_kind(self, path_str: str) -> str:
+        """Clasifica un archivo afectado según el layout del store:
+        `<user>/progress.json` (agregados), `<user>/attempts/<id>.json`
+        (intentos append-only) y `<user>/reports/<nombre>` (reportes
+        exportados). Cualquier otra ruta es `KIND_UNKNOWN`: el store no
+        puede razonar sobre su finalidad y la ruta semántica falla de forma
+        cerrada si quedó modificada."""
+        try:
+            rel = Path(path_str).relative_to(self.root)
+        except (ValueError, OSError):
+            return KIND_UNKNOWN
+        parts = rel.parts
+        if len(parts) == 2 and parts[1] == "progress.json":
+            return KIND_PROGRESS
+        if len(parts) == 3 and parts[1] == "attempts" and parts[2].endswith(".json"):
+            return KIND_ATTEMPT
+        if len(parts) == 3 and parts[1] == "reports":
+            return KIND_REPORT
+        return KIND_UNKNOWN
 
-        exact=True  -> restauración exacta: cada archivo preexistente debe
-                       coincidir BYTE A BYTE (sha256) con el contenido
-                       original registrado en el diario antes del rollback.
-        exact=False -> ruta semántica: solo invariantes estructurales que
-                       NINGUNA reparación semántica puede eximir: los
-                       archivos que debían eliminarse siguen sin existir,
-                       los preexistentes existen y los .json parsean. La
-                       validación del contenido reparado la aporta el
-                       validador explícito del llamador.
+    def _audit_rollback_journal(
+        self, exact: bool,
+    ) -> tuple[list[dict[str, Any]], list[SemanticRecoveryFile]]:
+        """Auditoría COMPLETA del diario de rollback (corrección de auditoría
+        PR #4): para CADA archivo tocado por la transacción fallida compara
+        el disco contra el estado esperado registrado al degradar (sha256 del
+        contenido original tomado ANTES del rollback, o ausencia) y clasifica
+        el resultado. La mera existencia o la validez sintáctica del JSON no
+        bastan: un estado parcial de la transacción fallida puede ser JSON
+        válido.
 
-        Asume `_STORE_LOCK` tomado y `self._degraded` distinto de None.
-        Fallo CERRADO: una entrada sin referencia fiable (formato antiguo o
-        registro incompleto) se reporta como problema — nunca se asume
-        recuperado lo que no se puede verificar."""
+        exact=True  -> restauración EXACTA (`verify_recovery`): todo archivo
+                       preexistente debe coincidir BYTE A BYTE con el estado
+                       original; cualquier diferencia es un problema.
+        exact=False -> ruta SEMÁNTICA (`verify_semantic_recovery`): un
+                       archivo preexistente cuyo contenido difiere no es un
+                       problema per se: se registra como "modificado" y
+                       exigirá acreditación explícita por archivo del
+                       validador con alcance. Se mantienen las invariantes
+                       estructurales que ninguna reparación puede eximir:
+                       los archivos que debían eliminarse siguen sin existir,
+                       los requeridos existen y pueden leerse, y los .json
+                       parsean.
+
+        Devuelve (problemas, archivos_auditados). Fallo CERRADO: una entrada
+        del diario sin referencia fiable (formato antiguo o registro
+        incompleto) se reporta como problema — nunca se asume recuperado lo
+        que no se puede verificar. Asume `_STORE_LOCK` tomado y
+        `self._degraded` distinto de None."""
         problems: list[dict[str, Any]] = []
+        files: list[SemanticRecoveryFile] = []
         for chk in self._degraded.get("checks", []):
-            path = Path(chk["path"])
+            path_str = chk.get("path")
             expect = chk.get("expect")
+            kind = self._classify_kind(path_str) if path_str else KIND_UNKNOWN
+            if not path_str or expect not in ("sha256", "absent"):
+                problems.append({
+                    "path": path_str,
+                    "problem": "entrada del diario sin referencia fiable "
+                               "(expect/sha256): no es posible verificar la "
+                               "recuperación (comprobación fallida por diseño)",
+                })
+                continue
+            path = Path(path_str)
             if expect == "absent":
                 if path.exists():
                     problems.append({
-                        "path": chk["path"],
+                        "path": path_str,
                         "problem": "sigue existiendo; el rollback debía eliminarlo "
                                    "(fue creado por la transacción fallida): "
                                    "revíselo y elimínelo manualmente",
                     })
+                else:
+                    files.append(SemanticRecoveryFile(
+                        path_str, kind, "absent", None, STATUS_ABSENT_OK))
                 continue
-            if expect != "sha256" or not chk.get("sha256"):
+            if not chk.get("sha256"):
                 problems.append({
-                    "path": chk["path"],
+                    "path": path_str,
                     "problem": "sin referencia fiable (sha256) del contenido original: "
                                "no es posible verificar la recuperación exacta "
                                "(comprobación fallida por diseño)",
@@ -543,7 +732,7 @@ class JsonProgressStore(ProgressStore):
                 continue
             if not path.exists():
                 problems.append({
-                    "path": chk["path"],
+                    "path": path_str,
                     "problem": "no existe; restáurelo byte a byte (p. ej. desde el .rbak)",
                 })
                 continue
@@ -551,33 +740,40 @@ class JsonProgressStore(ProgressStore):
                 actual_bytes = path.read_bytes()
             except OSError as exc:
                 problems.append({
-                    "path": chk["path"],
+                    "path": path_str,
                     "problem": f"no se pudo leer: {type(exc).__name__}: {exc}",
                 })
                 continue
+            actual = hashlib.sha256(actual_bytes).hexdigest()
+            if actual == chk["sha256"]:
+                files.append(SemanticRecoveryFile(
+                    path_str, kind, "sha256", chk["sha256"], STATUS_EXACT))
+                continue
             if exact:
-                actual = hashlib.sha256(actual_bytes).hexdigest()
-                if actual != chk["sha256"]:
-                    problems.append({
-                        "path": chk["path"],
-                        "problem": "el contenido DIFIERE del estado original esperado: "
-                                   f"sha256 real {actual[:16]}… != sha256 esperado "
-                                   f"{chk['sha256'][:16]}… (estado parcial de la "
-                                   "transacción fallida o contenido modificado; que "
-                                   "sea JSON válido NO basta). Restáurelo byte a byte "
-                                   "(p. ej. desde el .rbak) o, si reparó los agregados "
-                                   "con contenido legítimamente distinto, use la ruta "
-                                   "semántica explícita verify_semantic_recovery(validator)",
-                    })
-            elif path.suffix == ".json":
+                problems.append({
+                    "path": path_str,
+                    "problem": "el contenido DIFIERE del estado original esperado: "
+                               f"sha256 real {actual[:16]}… != sha256 esperado "
+                               f"{chk['sha256'][:16]}… (estado parcial de la "
+                               "transacción fallida o contenido modificado; que "
+                               "sea JSON válido NO basta). Restáurelo byte a byte "
+                               "(p. ej. desde el .rbak) o, si reparó los agregados "
+                               "con contenido legítimamente distinto, use la ruta "
+                               "semántica explícita verify_semantic_recovery(validator)",
+                })
+                continue
+            if path.suffix == ".json":
                 try:
                     json.loads(actual_bytes.decode("utf-8"))
                 except (UnicodeDecodeError, ValueError) as exc:
                     problems.append({
-                        "path": chk["path"],
+                        "path": path_str,
                         "problem": f"no es JSON válido: {type(exc).__name__}: {exc}",
                     })
-        return problems
+                    continue
+            files.append(SemanticRecoveryFile(
+                path_str, kind, "sha256", chk["sha256"], STATUS_MODIFIED))
+        return problems, files
 
     def verify_recovery(self) -> tuple[bool, list[dict[str, Any]]]:
         """Procedimiento explícito de recuperación EXACTA (corrección de
@@ -610,7 +806,7 @@ class JsonProgressStore(ProgressStore):
         with _STORE_LOCK:
             if self._degraded is None:
                 return True, []
-            problems = self._verify_expected_state(exact=True)
+            problems = self._audit_rollback_journal(exact=True)[0]
             if problems:
                 log.error("verify_recovery: recuperación exacta NO verificada; el "
                           "store SIGUE degradado. Problemas: %s", problems)
@@ -622,48 +818,93 @@ class JsonProgressStore(ProgressStore):
             return True, []
 
     def verify_semantic_recovery(
-        self, validator: Callable[["JsonProgressStore"], Any],
+        self, validator: Callable[[SemanticRecoveryContext], Any],
     ) -> tuple[bool, list[dict[str, Any]]]:
         """Ruta EXPLÍCITA de recuperación SEMÁNTICA (corrección de auditoría
-        PR #4), reservada a reparaciones con contenido legítimamente
-        distinto del original — p. ej. el operador reconstruyó los agregados
-        con tools/repair_progress.py (los intentos append-only son la fuente
-        de verdad) en lugar de restaurar byte a byte desde el `.rbak`.
+        PR #4; alcance por archivo), reservada a reparaciones con contenido
+        legítimamente distinto del original — p. ej. el operador reconstruyó
+        los agregados con tools/repair_progress.py (los intentos append-only
+        son la fuente de verdad) en lugar de restaurar byte a byte desde el
+        `.rbak`.
 
         NO se confunde con la restauración exacta del rollback
-        (`verify_recovery()`): aquí no se exige el sha256 del contenido
-        pre-transacción, pero la reparación debe quedar ACREDITADA:
+        (`verify_recovery()`, que sigue exigiendo el sha256 del estado
+        original): aquí no se exige coincidencia byte a byte, pero liberar el
+        store requiere ACREDITAR TODOS los archivos afectados, no solo un
+        veredicto genérico. Defecto auditado que esta versión cierra: un
+        validador que únicamente reconstruye los agregados de progreso NO
+        demuestra que los demás archivos tocados por el rollback —intentos,
+        reportes— estén íntegros; un intento adulterado (JSON válido) o un
+        reporte alterado que sigue existiendo colaban la recuperación.
+        Contrato:
 
-          1. Invariantes estructurales que ninguna reparación semántica
-             puede eximir: los archivos que el rollback debía eliminar
-             siguen sin existir; los preexistentes existen y los .json
-             parsean.
-          2. `validator(store)` —callable OBLIGATORIO— debe devolver
-             exactamente `True` tras validar la semántica del estado
-             reparado (p. ej. `LearningService.validate_progress_repair`:
-             los agregados actuales coinciden con la reconstrucción desde
-             los intentos). Resultado falso, `None` o excepción => el store
-             SIGUE degradado. El validador NO debe escribir vía el store
-             (seguirá recibiendo `StoreDegradedError`).
+          1. Auditoría completa del diario de rollback
+             (`_audit_rollback_journal(exact=False)`): los archivos que
+             debían eliminarse siguen sin existir; los requeridos existen,
+             pueden leerse y los .json parsean. Cada archivo preexistente
+             queda clasificado como "restaurado_exacto" (sha256 == estado
+             original registrado antes del rollback) o "modificado"
+             (contenido difiere). Entradas sin referencia fiable: fallo
+             cerrado.
+          2. Archivos modificados de tipo NO reconocido por el layout del
+             store: fallo cerrado — no se puede verificar su finalidad.
+          3. `validator(ctx)` —callable OBLIGATORIO— recibe el
+             `SemanticRecoveryContext` con la auditoría completa (`.store`
+             para acceso de solo lectura, `.user_id`, `.original_error`,
+             `.files`, `.modified_files()`) y DEBE:
+               a. verificar cada archivo modificado con alcance apropiado a
+                  su tipo y finalidad —progreso: coincidencia con una
+                  reconstrucción independiente desde la fuente de verdad;
+                  intentos: contrato, identidad y pertenencia; reportes:
+                  integridad exigida por su formato (nunca la mera
+                  existencia)—, llamando a `ctx.mark_validated(path,
+                  garantía)` por cada uno que acredite;
+               b. devolver exactamente `True`.
+             Excepción, resultado distinto de `True`, o CUALQUIER archivo
+             modificado sin acreditación explícita => el store SIGUE
+             degradado. El validador NO debe escribir vía el store (seguirá
+             recibiendo `StoreDegradedError`).
+             `LearningService.semantic_recovery_validator()` construye un
+             validador que cumple este contrato.
 
         Si todo se acredita: limpia el estado degradado y devuelve (True, []).
-        Si no: devuelve (False, problemas) y las escrituras siguen
-        rechazadas. Se ejecuta bajo `_STORE_LOCK` (serializada con toda
-        escritura y con `verify_recovery`).
+        Si no: devuelve (False, problemas) y las escrituras siguen rechazadas.
+        Se ejecuta bajo `_STORE_LOCK`: serializada con toda escritura, con
+        `verify_recovery` y con la propia transición de salida del estado
+        degradado — ninguna escritura puede intercalarse con la verificación.
+        No borra los `.rbak` (evidencia/material de recuperación).
         """
         if not callable(validator):
             raise TypeError(
                 "verify_semantic_recovery exige un validador callable que "
-                "acredite la reparación (p. ej. consistencia de agregados "
-                "contra el historial de intentos); sin validador explícito "
-                "no hay ruta semántica")
+                "acredite la reparación archivo por archivo "
+                "(SemanticRecoveryContext.mark_validated + veredicto True); "
+                "sin validador explícito no hay ruta semántica")
         with _STORE_LOCK:
             if self._degraded is None:
                 return True, []
-            problems = self._verify_expected_state(exact=False)
+            problems, files = self._audit_rollback_journal(exact=False)
+            # tipos no reconocidos: fallo cerrado ANTES de invocar al validador
+            for f in files:
+                if f.status == STATUS_MODIFIED and f.kind == KIND_UNKNOWN:
+                    problems.append({
+                        "path": f.path,
+                        "problem": "archivo modificado de tipo NO reconocido por el "
+                                   "layout del store: la ruta semántica no puede "
+                                   "verificar su finalidad (fallo cerrado); "
+                                   "restáurelo byte a byte (ruta exacta) o repárelo "
+                                   "y reconstruya la instancia",
+                    })
+            ctx: Optional[SemanticRecoveryContext] = None
             if not problems:
+                ctx = SemanticRecoveryContext(
+                    store=self,
+                    user_id=self._degraded.get("user_id"),
+                    original_error=self._degraded.get("original"),
+                    files=files,
+                )
                 try:
-                    verdict = validator(self)
+                    verdict = validator(ctx)
                 except BaseException as exc:
                     verdict = None
                     problems.append({
@@ -671,19 +912,37 @@ class JsonProgressStore(ProgressStore):
                         "problem": "el validador semántico lanzó una excepción: "
                                    f"{type(exc).__name__}: {exc}",
                     })
-                if verdict is not True and not problems:
-                    problems.append({
-                        "path": None,
-                        "problem": "el validador semántico NO acreditó la reparación "
-                                   f"(devolvió {verdict!r}); el store sigue degradado",
-                    })
+                if verdict is not True:
+                    if not problems:
+                        problems.append({
+                            "path": None,
+                            "problem": "el validador semántico NO acreditó la reparación "
+                                       f"(devolvió {verdict!r}); el store sigue degradado",
+                        })
+                else:
+                    # Cobertura POR ARCHIVO (corrección de auditoría): un True
+                    # genérico NO acredita archivos individuales; todo archivo
+                    # modificado debe quedar explícitamente validado.
+                    for f in files:
+                        if f.status == STATUS_MODIFIED and f.path not in ctx.validated:
+                            problems.append({
+                                "path": f.path,
+                                "problem": "archivo afectado SIN verificación suficiente: el "
+                                           "validador semántico devolvió True pero NO acreditó "
+                                           "explícitamente este archivo (mark_validated); un "
+                                           "veredicto genérico (p. ej. agregados "
+                                           "reconstruibles) no cubre su integridad",
+                            })
             if problems:
                 log.error("verify_semantic_recovery: recuperación semántica NO "
                           "acreditada; el store SIGUE degradado. Problemas: %s",
                           problems)
                 return False, problems
-            log.warning("verify_semantic_recovery: reparación VALIDADA por el "
-                        "validador explícito; el store sale del estado degradado "
-                        "y reanuda las escrituras")
+            acreditados = "; ".join(
+                f"{Path(p).name}: {g}" for p, g in (ctx.validated if ctx else {}).items()
+            ) or "sin archivos modificados (todos en estado original o ausentes)"
+            log.warning("verify_semantic_recovery: reparación VALIDADA con cobertura "
+                        "por archivo [%s]; el store sale del estado degradado y "
+                        "reanuda las escrituras", acreditados)
             self._degraded = None
             return True, []

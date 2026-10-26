@@ -184,7 +184,7 @@ kiwi-academy/
 │   │   ├── api/v1/            # auth/config, cursos, lecciones, exámenes, progreso
 │   │   ├── core/              # auth (JWT), models, services, evaluation, feedback, errors
 │   │   └── storage/           # base (puertos) + json_store + sql_store + factory
-│   └── tests/                 # 115 tests: evaluación + API + auth/JWT + examen + integridad + SQL
+│   └── tests/                 # 141 tests: evaluación + API + auth/JWT + examen + integridad + SQL
 ├── content/courses/soc-n1/    # CONTENIDO (YAML versionado)
 │   ├── course.yaml
 │   ├── modules/<id>/{module.yaml, lessons/<id>.yaml}
