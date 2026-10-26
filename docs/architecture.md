@@ -96,15 +96,19 @@ el revisor autorizado registra en la plataforma.
 | `content/**.yaml` en git | Misma estructura en tablas `courses/modules/lessons/exercises` + CMS propio, o seguir con git (recomendado: content-as-code) |
 | `data/users/<uid>/progress.json` | ✅ **Ya disponible:** tabla `kiwi_progress` vía `SqlProgressStore` (`KIWI_DATABASE_URL=postgresql://...` o `sqlite:///...`) |
 | `data/users/<uid>/attempts/*.json` | ✅ **Ya disponible:** tabla `kiwi_attempts` (una fila por intento, mismo JSON) |
-| Locks por archivo + escritura atómica (tmp+fsync+replace) | ✅ **Iteración 3:** `transaction()` y `mutate_progress()` en el puerto — SQL con transacciones reales (Postgres `SELECT…FOR UPDATE`, SQLite `BEGIN IMMEDIATE`); JSON serializa en proceso |
+| Locks por archivo + escritura atómica (tmp+fsync+replace) | ✅ **Iteración 3:** `transaction()` y `mutate_progress()` en el puerto — SQL con transacciones reales (Postgres `SELECT…FOR UPDATE`, SQLite `BEGIN IMMEDIATE`); JSON con serialización **y rollback real** (diario copy-on-write; si la restauración queda incompleta se lanza `TransactionRollbackError` — nunca se silencia ni se presenta como recuperado — y el store queda **degradado**: una comprobación centralizada rechaza TODAS sus escrituras públicas (transaccionales y directas) hasta una recuperación **verificada**: `verify_recovery()` (restauración exacta, byte a byte contra el sha256 del estado original registrado en el diario antes del rollback) o `verify_semantic_recovery(validator)` (reparaciones con contenido legítimamente distinto, con **validación de alcance por archivo**: progreso contra reconstrucción independiente desde los intentos, intentos contra contrato/identidad/pertenencia, reportes por regeneración determinista — ningún archivo afectado modificado queda liberado sin acreditación explícita; un veredicto genérico no basta; ver `LearningService.semantic_recovery_validator`) o reconstrucción de la instancia; limitación residual ante fallos físicos documentada en `json_store.py`) |
 | Un proceso uvicorn local | N procesos/contenedores; el storage ya es stateless |
 
 La migración de datos existentes es un comando:
 `KIWI_DATABASE_URL=... python tools/migrate_json_to_sql.py` (idempotente).
 
-**Iteración 3 — integridad:** los intentos (append-only) son la fuente de
-verdad; los agregados del progreso son datos derivados y reconstruibles con
-`tools/repair_progress.py` (`LearningService.rebuild_progress_from_attempts`).
+**Iteración 3 — integridad:** las operaciones compuestas (envío de examen,
+revisión humana) son unidades transaccionales en AMBOS stores: la consistencia
+normal no depende de reparación manual. Los intentos (append-only) son la
+fuente de verdad; los agregados del progreso son datos derivados y
+reconstruibles con `tools/repair_progress.py`
+(`LearningService.rebuild_progress_from_attempts`), que queda como mecanismo
+ADICIONAL ante catástrofes externas (p. ej. muerte del proceso).
 La idempotencia de envíos de examen usa la sesión de servidor como clave:
 reenviar una sesión consumida reproduce el resultado original
 (`idempotent_replay: true`) sin duplicar intentos. Los reportes tienen guarda

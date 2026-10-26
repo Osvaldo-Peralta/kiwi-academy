@@ -97,9 +97,12 @@ class ProgressStore(ABC):
 
     @abstractmethod
     def save_report(self, user_id: str, attempt_id: str, name: str, content: str) -> Optional[str]:
-        """Guarda un reporte. NUNCA debe sobrescribir/reasignar un reporte
-        propiedad de OTRO usuario: si (attempt_id, name) ya existe con dueño
-        distinto, devuelve None (denegado) sin modificar nada."""
+        """Guarda un reporte con validación de propiedad reforzada:
+        - el intento DEBE existir y pertenecer a `user_id` (no se pueden
+          vincular reportes a intentos ajenos ni inexistentes);
+        - un reporte existente de OTRO usuario jamás se sobrescribe ni se
+          reasigna.
+        Devuelve None (denegado, sin efectos) si no se cumple."""
 
     # -- Iteración 3: atomicidad ---------------------------------------------
 
@@ -112,9 +115,27 @@ class ProgressStore(ABC):
         - SQL: transacción real (Postgres BEGIN + bloqueo de fila
           SELECT…FOR UPDATE sobre kiwi_progress; SQLite BEGIN IMMEDIATE con
           busy-timeout). Excepción => ROLLBACK completo.
-        - JSON: lock de store (serializa operaciones compuestas en el
-          proceso; el store JSON es single-proceso por diseño — la garantía
-          multi-worker la da el store SQL).
+        - JSON: lock global de store (serialización) + diario copy-on-write:
+          excepción => los archivos escritos durante la transacción se
+          restauran/borran (rollback en proceso; el store JSON es
+          single-proceso por diseño — la garantía multi-worker la da SQL).
+          Si la restauración queda incompleta, se lanza
+          `json_store.TransactionRollbackError` (encadenada al error
+          original, con detalle de archivos no restaurados): el fallo de
+          recuperación NUNCA se silencia ni se presenta como recuperado, y
+          el store queda DEGRADADO: rechaza TODAS sus operaciones públicas
+          de escritura —transaccionales y directas— (`StoreDegradedError`,
+          comprobación centralizada) hasta una recuperación explícita y
+          verificada: `verify_recovery()` (restauración EXACTA, comprobada
+          byte a byte contra el sha256 original registrado antes del
+          rollback) o `verify_semantic_recovery(validator)` (ruta explícita
+          para reparaciones con contenido legítimamente distinto: exige un
+          validador CON ALCANCE POR ARCHIVO que acredite explícitamente cada
+          archivo afectado modificado —progreso, intentos, reportes— vía
+          `SemanticRecoveryContext.mark_validated`; un veredicto genérico no
+          libera el store; ver
+          `LearningService.semantic_recovery_validator`), o la
+          reconstrucción de la instancia tras reparar los archivos.
 
         Anidable: una transacción interna se une a la externa.
         """

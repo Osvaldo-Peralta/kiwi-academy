@@ -282,10 +282,10 @@ class SqlProgressStore(ProgressStore):
 
         if tx is not None:
             cur = tx.cursor()
-            cur.execute(
-                self._sql("SELECT data FROM kiwi_attempts WHERE id = ? AND user_id = ?"),
-                (attempt_id, user_id),
-            )
+            select_sql = "SELECT data FROM kiwi_attempts WHERE id = ? AND user_id = ?"
+            if self.is_postgres:
+                select_sql += " FOR UPDATE"   # bloqueo de fila dentro de la tx
+            cur.execute(self._sql(select_sql), (attempt_id, user_id))
             row = cur.fetchone()
             if not row or self._status_of(row[0]) != expected_status:
                 return False
@@ -383,6 +383,18 @@ class SqlProgressStore(ProgressStore):
         conn = tx or self._connect()
         try:
             cur = conn.cursor()
+            # (auditoría Iter 3, punto 3) Propiedad del INTENTO: solo se crea
+            # o actualiza un reporte si el intento existe y pertenece a este
+            # usuario. Impide vincular reportes a intentos ajenos/inexistentes.
+            cur.execute(
+                self._sql("SELECT user_id FROM kiwi_attempts WHERE id = ?"),
+                (attempt_id,),
+            )
+            att_row = cur.fetchone()
+            if not att_row or att_row[0] != user_id:
+                if tx is None:
+                    conn.rollback()
+                return None
             cur.execute(
                 self._sql("SELECT user_id FROM kiwi_reports WHERE attempt_id = ? AND name = ?"),
                 (attempt_id, name),
